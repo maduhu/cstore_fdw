@@ -26,6 +26,8 @@
 #define OPTION_NAME_COMPRESSION_TYPE "compression"
 #define OPTION_NAME_STRIPE_ROW_COUNT "stripe_row_count"
 #define OPTION_NAME_BLOCK_ROW_COUNT "block_row_count"
+#define OPTION_NAME_CEPH_CONF_FILE "ceph_conf"
+#define OPTION_NAME_CEPH_POOL_NAME "ceph_pool"
 
 /* Default values for option parameters */
 #define DEFAULT_COMPRESSION_TYPE COMPRESSION_NONE
@@ -71,14 +73,16 @@ typedef struct CStoreValidOption
 
 
 /* Array of options that are valid for cstore_fdw */
-static const uint32 ValidOptionCount = 4;
+static const uint32 ValidOptionCount = 6;
 static const CStoreValidOption ValidOptionArray[] =
 {
 	/* foreign table options */
 	{ OPTION_NAME_FILENAME, ForeignTableRelationId },
 	{ OPTION_NAME_COMPRESSION_TYPE, ForeignTableRelationId },
 	{ OPTION_NAME_STRIPE_ROW_COUNT, ForeignTableRelationId },
-	{ OPTION_NAME_BLOCK_ROW_COUNT, ForeignTableRelationId }
+	{ OPTION_NAME_BLOCK_ROW_COUNT, ForeignTableRelationId },
+	{ OPTION_NAME_CEPH_CONF_FILE, ForeignTableRelationId },
+	{ OPTION_NAME_CEPH_POOL_NAME, ForeignTableRelationId }
 };
 
 
@@ -105,6 +109,8 @@ typedef struct CStoreFdwOptions
 	CompressionType compressionType;
 	uint64 stripeRowCount;
 	uint32 blockRowCount;
+	char *ceph_conf_file;
+	char *ceph_pool_name;
 
 } CStoreFdwOptions;
 

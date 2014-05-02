@@ -55,9 +55,9 @@ static uint64 CopyIntoCStoreTable(const CopyStmt *copyStatement,
 static StringInfo OptionNamesString(Oid currentContextId);
 static CStoreFdwOptions * CStoreGetOptions(Oid foreignTableId);
 static char * CStoreGetOptionValue(Oid foreignTableId, const char *optionName);
-static void ValidateForeignTableOptions(char *filename, char *compressionTypeString,
-										char *stripeRowCountString,
-										char *blockRowCountString);
+static void ValidateForeignTableOptions(char *filename, char *ceph_conf_file,
+		char *ceph_pool_name, char *compressionTypeString,
+		char *stripeRowCountString, char *blockRowCountString);
 static CompressionType ParseCompressionType(const char *compressionTypeString);
 static void CStoreGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 									Oid foreignTableId);
@@ -351,6 +351,8 @@ cstore_fdw_validator(PG_FUNCTION_ARGS)
 	char *compressionTypeString = NULL;
 	char *stripeRowCountString = NULL;
 	char *blockRowCountString = NULL;
+	char *ceph_conf_file = NULL;
+	char *ceph_pool_name = NULL;
 
 	foreach(optionCell, optionList)
 	{
@@ -386,6 +388,14 @@ cstore_fdw_validator(PG_FUNCTION_ARGS)
 		{
 			filename = defGetString(optionDef);
 		}
+		else if (strncmp(optionName, OPTION_NAME_CEPH_CONF_FILE, NAMEDATALEN) == 0)
+		{
+			ceph_conf_file = defGetString(optionDef);
+		}
+		else if (strncmp(optionName, OPTION_NAME_CEPH_POOL_NAME, NAMEDATALEN) == 0)
+		{
+			ceph_pool_name = defGetString(optionDef);
+		}
 		else if (strncmp(optionName, OPTION_NAME_COMPRESSION_TYPE, NAMEDATALEN) == 0)
 		{
 			compressionTypeString = defGetString(optionDef);
@@ -402,8 +412,8 @@ cstore_fdw_validator(PG_FUNCTION_ARGS)
 
 	if (optionContextId == ForeignTableRelationId)
 	{
-		ValidateForeignTableOptions(filename, compressionTypeString,
-									stripeRowCountString, blockRowCountString);
+		ValidateForeignTableOptions(filename, ceph_conf_file, ceph_pool_name,
+				compressionTypeString, stripeRowCountString, blockRowCountString);
 	}
 
 	PG_RETURN_VOID();
@@ -460,8 +470,12 @@ CStoreGetOptions(Oid foreignTableId)
 	char *compressionTypeString = NULL;
 	char *stripeRowCountString = NULL;
 	char *blockRowCountString = NULL;
+	char *ceph_conf_file;
+	char *ceph_pool_name;
 
 	filename = CStoreGetOptionValue(foreignTableId, OPTION_NAME_FILENAME);
+	ceph_conf_file = CStoreGetOptionValue(foreignTableId, OPTION_NAME_CEPH_CONF_FILE);
+	ceph_pool_name = CStoreGetOptionValue(foreignTableId, OPTION_NAME_CEPH_POOL_NAME);
 	compressionTypeString = CStoreGetOptionValue(foreignTableId,
 												 OPTION_NAME_COMPRESSION_TYPE);
 	stripeRowCountString = CStoreGetOptionValue(foreignTableId,
@@ -469,8 +483,8 @@ CStoreGetOptions(Oid foreignTableId)
 	blockRowCountString = CStoreGetOptionValue(foreignTableId,
 											   OPTION_NAME_BLOCK_ROW_COUNT);
 
-	ValidateForeignTableOptions(filename, compressionTypeString,
-								stripeRowCountString, blockRowCountString);
+	ValidateForeignTableOptions(filename, ceph_conf_file, ceph_pool_name,
+			compressionTypeString, stripeRowCountString, blockRowCountString);
 
 	/* parse provided options */
 	if (compressionTypeString != NULL)
@@ -491,6 +505,8 @@ CStoreGetOptions(Oid foreignTableId)
 	cstoreFdwOptions->compressionType = compressionType;
 	cstoreFdwOptions->stripeRowCount = stripeRowCount;
 	cstoreFdwOptions->blockRowCount = blockRowCount;
+	cstoreFdwOptions->ceph_conf_file = ceph_conf_file;
+	cstoreFdwOptions->ceph_pool_name = ceph_pool_name;
 
 	return cstoreFdwOptions;
 }
@@ -538,14 +554,24 @@ CStoreGetOptionValue(Oid foreignTableId, const char *optionName)
  * considered invalid.
  */
 static void
-ValidateForeignTableOptions(char *filename, char *compressionTypeString,
-							char *stripeRowCountString, char *blockRowCountString)
+ValidateForeignTableOptions(char *filename, char *ceph_conf_file, char *ceph_pool_name,
+		char *compressionTypeString, char *stripeRowCountString, char *blockRowCountString)
 {
 	/* check if filename is specified */
 	if (filename == NULL)
 	{
 		ereport(ERROR, (errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
 						errmsg("filename is required for cstore foreign tables")));
+	}
+
+	if (!ceph_conf_file) {
+		ereport(ERROR, (errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
+						errmsg("ceph conf file is required for cstore foreign tables")));
+	}
+
+	if (!ceph_pool_name) {
+		ereport(ERROR, (errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
+						errmsg("ceph pool name is required for cstore foreign tables")));
 	}
 
 	/* check if the provided compression type is valid */
