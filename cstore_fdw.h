@@ -19,6 +19,7 @@
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
 #include "lib/stringinfo.h"
+#include <rados/librados.h>
 
 
 /* Defines for valid option names */
@@ -239,6 +240,9 @@ typedef struct TableReadState
 	 */
 	List *projectedColumnList;
 
+  rados_t *rados;
+  rados_ioctx_t *ioctx;
+
 	List *whereClauseList;
 	MemoryContext stripeReadContext;
 	StripeData *stripeData;
@@ -260,6 +264,7 @@ typedef struct TableWriteState
 	FmgrInfo **comparisonFunctionArray;
 	uint64 currentFileOffset;
 
+	rados_t rados;
 
 	MemoryContext stripeWriteContext;
 	StripeData *stripeData;
@@ -278,19 +283,20 @@ extern Datum cstore_fdw_handler(PG_FUNCTION_ARGS);
 extern Datum cstore_fdw_validator(PG_FUNCTION_ARGS);
 
 /* Function declarations for writing to a cstore file */
-extern TableWriteState * CStoreBeginWrite(const char *filename,
+extern TableWriteState * CStoreBeginWrite(const char *filename, rados_ioctx_t *ioctx,
 										  CompressionType compressionType,
 										  uint64 stripeMaxRowCount,
 										  uint32 blockRowCount,
 										  TupleDesc tupleDescriptor);
 extern void CStoreWriteRow(TableWriteState *state, Datum *columnValues,
 						   bool *columnNulls);
-extern void CStoreEndWrite(TableWriteState * state);
+extern void CStoreEndWrite(rados_ioctx_t *ioctx, TableWriteState * state);
 
 /* Function declarations for reading from a cstore file */
-extern TableReadState * CStoreBeginRead(const char *filename, TupleDesc tupleDescriptor,
-										List *projectedColumnList, List *qualConditions);
-extern TableFooter * CStoreReadFooter(StringInfo tableFooterFilename);
+extern TableReadState * CStoreBeginRead(const char *filename, rados_t *rados,
+    rados_ioctx_t *ioctx, TupleDesc tupleDescriptor, List *projectedColumnList,
+    List *qualConditions);
+extern TableFooter *CStoreReadFooter(rados_ioctx_t *ioctx, StringInfo tableFooterFilename);
 extern bool CStoreReadFinished(TableReadState *state);
 extern bool CStoreReadNextRow(TableReadState *state, Datum *columnValues,
 							  bool *columnNulls);

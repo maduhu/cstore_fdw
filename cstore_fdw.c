@@ -214,6 +214,9 @@ CopyIntoCStoreTable(const CopyStmt *copyStatement, const char *queryString)
 	TableWriteState *writeState = NULL;
 	CStoreFdwOptions *cstoreFdwOptions = NULL;
 	MemoryContext tupleContext = NULL;
+	rados_t *rados;
+	rados_ioctx_t *ioctx;
+	int ret;
 
 	List *columnNameList = copyStatement->attlist;
 	if (columnNameList != NULL)
@@ -261,6 +264,33 @@ CopyIntoCStoreTable(const CopyStmt *copyStatement, const char *queryString)
 
 	cstoreFdwOptions = CStoreGetOptions(relationId);
 
+	rados = palloc0(sizeof(*rados));
+	ret = rados_create(rados, "admin");
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not create rados cluster object: ret=%d", ret)));
+	}
+
+	ret = rados_conf_read_file(*rados, cstoreFdwOptions->ceph_conf_file);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not read ceph conf file: ret=%d", ret)));
+	}
+
+	ret = rados_connect(*rados);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("xcould not connect to ceph: ret=%d", ret)));
+	}
+
+	ioctx = palloc0(sizeof(*ioctx));
+	ret = rados_ioctx_create(*rados, cstoreFdwOptions->ceph_pool_name, ioctx);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not open ceph pool: %s ret=%d",
+				cstoreFdwOptions->ceph_pool_name, ret)));
+	}
+
 	/*
 	 * We create a new memory context called tuple context, and read and write
 	 * each row's values within this memory context. After each read and write,
@@ -280,11 +310,11 @@ CopyIntoCStoreTable(const CopyStmt *copyStatement, const char *queryString)
 							  copyStatement->options);
 
 	/* init state to write to the cstore file */
-	writeState = CStoreBeginWrite(cstoreFdwOptions->filename,
-								  cstoreFdwOptions->compressionType,
-								  cstoreFdwOptions->stripeRowCount,
-								  cstoreFdwOptions->blockRowCount,
-								  tupleDescriptor);
+	writeState = CStoreBeginWrite(cstoreFdwOptions->filename, ioctx,
+			cstoreFdwOptions->compressionType,
+			cstoreFdwOptions->stripeRowCount,
+			cstoreFdwOptions->blockRowCount,
+			tupleDescriptor);
 
 	while (nextRowFound)
 	{
@@ -305,8 +335,11 @@ CopyIntoCStoreTable(const CopyStmt *copyStatement, const char *queryString)
 
 	/* end read/write sessions and close the relation */
 	EndCopyFrom(copyState);
-	CStoreEndWrite(writeState);
+	CStoreEndWrite(ioctx, writeState);
 	heap_close(relation, ExclusiveLock);
+
+	rados_ioctx_destroy(*ioctx);
+	rados_shutdown(*rados);
 
 	return processedRowCount;
 }
@@ -927,6 +960,9 @@ CStoreBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	ForeignScan *foreignScan = NULL;
 	List *foreignPrivateList = NIL;
 	List *whereClauseList = NIL;
+	rados_t *rados;
+	rados_ioctx_t *ioctx;
+	int ret;
 
 	/* if Explain with no Analyze, do nothing */
 	if (executorFlags & EXEC_FLAG_EXPLAIN_ONLY)
@@ -937,13 +973,40 @@ CStoreBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	foreignTableId = RelationGetRelid(scanState->ss.ss_currentRelation);
 	cstoreFdwOptions = CStoreGetOptions(foreignTableId);
 
+	rados = palloc0(sizeof(*rados));
+	ret = rados_create(rados, "admin");
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not create rados cluster object: ret=%d", ret)));
+	}
+
+	ret = rados_conf_read_file(*rados, cstoreFdwOptions->ceph_conf_file);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not read ceph conf file: ret=%d", ret)));
+	}
+
+	ret = rados_connect(*rados);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("xcould not connect to ceph: ret=%d", ret)));
+	}
+
+	ioctx = palloc0(sizeof(*ioctx));
+	ret = rados_ioctx_create(*rados, cstoreFdwOptions->ceph_pool_name, ioctx);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not open ceph pool: %s ret=%d",
+				cstoreFdwOptions->ceph_pool_name, ret)));
+	}
+
 	foreignScan = (ForeignScan *) scanState->ss.ps.plan;
 	foreignPrivateList = (List *) foreignScan->fdw_private;
 	whereClauseList = foreignScan->scan.plan.qual;
 
 	columnList = (List *) linitial(foreignPrivateList);
-	readState = CStoreBeginRead(cstoreFdwOptions->filename, tupleDescriptor,
-								columnList, whereClauseList);
+	readState = CStoreBeginRead(cstoreFdwOptions->filename, rados, ioctx,
+			tupleDescriptor, columnList, whereClauseList);
 
 	scanState->fdw_state = (void *) readState;
 }
