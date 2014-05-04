@@ -58,8 +58,6 @@ static void UpdateBlockSkipNodeMinMax(ColumnBlockSkipNode *blockSkipNode,
 static Datum DatumCopy(Datum datum, bool datumTypeByValue, int datumTypeLength);
 static void AppendStripeMetadata(TableFooter *tableFooter,
 								 StripeMetadata stripeMetadata);
-static void WriteToFile(FILE *file, void *data, uint32 dataLength);
-static void SyncAndCloseFile(FILE *file);
 
 static void
 WriteToObject(rados_ioctx_t *ioctx, const char *oid, void *data, uint32 dataLength, uint64 offset)
@@ -125,7 +123,6 @@ CStoreBeginWrite(const char *filename, rados_ioctx_t *ioctx,
 		TupleDesc tupleDescriptor)
 {
 	TableWriteState *writeState = NULL;
-	FILE *tableFile = NULL;
 	StringInfo tableFooterFilename = NULL;
 	TableFooter *tableFooter = NULL;
 	FmgrInfo **comparisonFunctionArray = NULL;
@@ -150,15 +147,6 @@ CStoreBeginWrite(const char *filename, rados_ioctx_t *ioctx,
 				errmsg("could not create table file: ret=%d", ret)));
 		}
 
-		// FIXME: remove when pure-RADOS
-		tableFile = AllocateFile(filename, "w");
-		if (tableFile == NULL)
-		{
-			ereport(ERROR, (errcode_for_file_access(),
-							errmsg("could not open file \"%s\" for writing: %m",
-								   filename)));
-		}
-
 		tableFooter = palloc0(sizeof(TableFooter));
 		tableFooter->blockRowCount = blockRowCount;
 		tableFooter->stripeMetadataList = NIL;
@@ -167,15 +155,6 @@ CStoreBeginWrite(const char *filename, rados_ioctx_t *ioctx,
 		if (ret) {
 			ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
 				errmsg("table file not found: ret=%d", ret)));
-		}
-
-		// FIXME: remove when pure-RADOS
-		tableFile = AllocateFile(filename, "r+");
-		if (tableFile == NULL)
-		{
-			ereport(ERROR, (errcode_for_file_access(),
-							errmsg("could not open file \"%s\" for writing: %m",
-								   filename)));
 		}
 
 		tableFooter = CStoreReadFooter(ioctx, tableFooterFilename);
@@ -189,7 +168,6 @@ CStoreBeginWrite(const char *filename, rados_ioctx_t *ioctx,
 	{
 		StripeMetadata *lastStripe = NULL;
 		uint64 lastStripeSize = 0;
-		int fseekResult = 0;
 
 		lastStripe = llast(tableFooter->stripeMetadataList);
 		lastStripeSize += lastStripe->skipListLength;
@@ -197,14 +175,6 @@ CStoreBeginWrite(const char *filename, rados_ioctx_t *ioctx,
 		lastStripeSize += lastStripe->footerLength;
 
 		currentFileOffset = lastStripe->fileOffset + lastStripeSize;
-
-		errno = 0;
-		fseekResult = fseeko(tableFile, currentFileOffset, SEEK_SET);
-		if (fseekResult != 0)
-		{
-			ereport(ERROR, (errcode_for_file_access(),
-							errmsg("could not seek in file \"%s\": %m", filename)));
-		}
 	}
 
 	/* get comparison function pointers for each of the columns */
@@ -230,7 +200,6 @@ CStoreBeginWrite(const char *filename, rados_ioctx_t *ioctx,
 											   ALLOCSET_DEFAULT_MAXSIZE);
 
 	writeState = palloc0(sizeof(TableWriteState));
-	writeState->tableFile = tableFile;
 	writeState->tableFilename = tableFilename;
 	writeState->tableFooterFilename = tableFooterFilename;
 	writeState->tableFooter = tableFooter;
@@ -365,8 +334,6 @@ CStoreEndWrite(rados_ioctx_t *ioctx, TableWriteState *writeState)
 		AppendStripeMetadata(writeState->tableFooter, stripeMetadata);
 	}
 
-	SyncAndCloseFile(writeState->tableFile);
-
 	tableFooterFilename = writeState->tableFooterFilename;
 	CStoreWriteFooter(ioctx, tableFooterFilename, writeState->tableFooter);
 
@@ -474,7 +441,6 @@ FlushStripe(TableWriteState *writeState)
 	uint32 columnIndex = 0;
 	uint32 blockIndex = 0;
 
-	FILE *tableFile = writeState->tableFile;
 	StripeData *stripeData = writeState->stripeData;
 	StripeSkipList *stripeSkipList = writeState->stripeSkipList;
 	CompressionType compressionType = writeState->compressionType;
@@ -590,8 +556,6 @@ FlushStripe(TableWriteState *writeState)
 	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
 	{
 		StringInfo skipListBuffer = skipListBufferArray[columnIndex];
-		WriteToFile(tableFile, skipListBuffer->data, skipListBuffer->len);
-
 		WriteToObject(ioctx, tableFilename->data, skipListBuffer->data,
 				skipListBuffer->len, objoffset);
 		objoffset += skipListBuffer->len;
@@ -604,8 +568,6 @@ FlushStripe(TableWriteState *writeState)
 		for (blockIndex = 0; blockIndex < stripeSkipList->blockCount; blockIndex++)
 		{
 			StringInfo existsBuffer = existsBufferArray[columnIndex][blockIndex];
-			WriteToFile(tableFile, existsBuffer->data, existsBuffer->len);
-
 			WriteToObject(ioctx, tableFilename->data, existsBuffer->data,
 					existsBuffer->len, objoffset);
 			objoffset += existsBuffer->len;
@@ -614,8 +576,6 @@ FlushStripe(TableWriteState *writeState)
 		for (blockIndex = 0; blockIndex < stripeSkipList->blockCount; blockIndex++)
 		{
 			StringInfo valueBuffer = valueBufferArray[columnIndex][blockIndex];
-			WriteToFile(tableFile, valueBuffer->data, valueBuffer->len);
-
 			WriteToObject(ioctx, tableFilename->data, valueBuffer->data,
 					valueBuffer->len, objoffset);
 			objoffset += valueBuffer->len;
@@ -623,8 +583,6 @@ FlushStripe(TableWriteState *writeState)
 	}
 
 	/* finally, we flush the footer buffer */
-	WriteToFile(tableFile, stripeFooterBuffer->data, stripeFooterBuffer->len);
-
 	WriteToObject(ioctx, tableFilename->data, stripeFooterBuffer->data,
 			stripeFooterBuffer->len, objoffset);
 	objoffset += stripeFooterBuffer->len;
@@ -986,73 +944,4 @@ AppendStripeMetadata(TableFooter *tableFooter, StripeMetadata stripeMetadata)
 
 	tableFooter->stripeMetadataList = lappend(tableFooter->stripeMetadataList,
 											  stripeMetadataCopy);
-}
-
-
-/* Writes the given data to the given file pointer and checks for errors. */
-static void
-WriteToFile(FILE *file, void *data, uint32 dataLength)
-{
-	int writeResult = 0;
-	int errorResult = 0;
-
-	if (dataLength == 0)
-	{
-		return;
-	}
-
-	errno = 0;
-	writeResult = fwrite(data, dataLength, 1, file);
-	if (writeResult != 1)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not write file: %m")));
-	}
-
-	errorResult = ferror(file);
-	if (errorResult != 0)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("error in file: %m")));
-	}
-}
-
-
-/* Flushes, syncs, and closes the given file pointer and checks for errors. */
-static void
-SyncAndCloseFile(FILE *file)
-{
-	int flushResult = 0;
-	int syncResult = 0;
-	int errorResult = 0;
-	int freeResult = 0;
-
-	errno = 0;
-	flushResult = fflush(file);
-	if (flushResult != 0)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not flush file: %m")));
-	}
-
-	syncResult = pg_fsync(fileno(file));
-	if (syncResult != 0)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not sync file: %m")));
-	}
-
-	errorResult = ferror(file);
-	if (errorResult != 0)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("error in file: %m")));
-	}
-
-	freeResult = FreeFile(file);
-	if (freeResult != 0)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not close file: %m")));
-	}
 }

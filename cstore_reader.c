@@ -35,7 +35,7 @@
 
 
 /* static function declarations */
-static StripeData * LoadFilteredStripeData(FILE *tableFile,
+static StripeData * LoadFilteredStripeData(TableReadState *readState,
 										   StripeMetadata *stripeMetadata,
 										   TupleDesc tupleDescriptor,
 										   List *projectedColumnList,
@@ -43,14 +43,14 @@ static StripeData * LoadFilteredStripeData(FILE *tableFile,
 static void ReadStripeNextRow(StripeData *stripeData, List *projectedColumnList,
 							  uint64 blockIndex, uint64 blockRowIndex,
 							  Datum *columnValues, bool *columnNulls);
-static ColumnData * LoadColumnData(FILE *tableFile,
+static ColumnData * LoadColumnData(TableReadState *readState,
 								   ColumnBlockSkipNode *blockSkipNodeArray,
 								   uint32 blockCount, uint64 existsFileOffset,
 								   uint64 valueFileOffset,
 								   Form_pg_attribute attributeForm);
-static StripeFooter * LoadStripeFooter(FILE *tableFile, StripeMetadata *stripeMetadata,
+static StripeFooter * LoadStripeFooter(TableReadState *readState, StripeMetadata *stripeMetadata,
 									   uint32 columnCount);
-static StripeSkipList * LoadStripeSkipList(FILE *tableFile,
+static StripeSkipList * LoadStripeSkipList(TableReadState *readState,
 										   StripeMetadata *stripeMetadata,
 										   StripeFooter *stripeFooter,
 										   uint32 columnCount,
@@ -70,7 +70,6 @@ static bool * DeserializeBoolArray(StringInfo boolArrayBuffer, uint32 boolArrayL
 static Datum * DeserializeDatumArray(StringInfo datumBuffer, bool *existsArray,
 									 uint32 datumCount, bool datumTypeByValue,
 									 int datumTypeLength, char datumTypeAlign);
-static StringInfo ReadFromFile(FILE *file, uint64 offset, uint32 size);
 static StringInfo DecompressBuffer(StringInfo buffer, CompressionType compressionType);
 
 static StringInfo
@@ -150,23 +149,24 @@ CStoreBeginRead(const char *filename, rados_t *rados, rados_ioctx_t *ioctx,
 {
 	TableReadState *readState = NULL;
 	TableFooter *tableFooter = NULL;
-	FILE *tableFile = NULL;
+	StringInfo tableFilename = NULL;
 	MemoryContext stripeReadContext = NULL;
+	int ret;
 
 	StringInfo tableFooterFilename = makeStringInfo();
 	appendStringInfo(tableFooterFilename, "%s%s", filename, CSTORE_FOOTER_FILE_SUFFIX);
+
+	tableFilename = makeStringInfo();
+	appendStringInfo(tableFilename, "%s", filename);
 
 	tableFooter = CStoreReadFooter(ioctx, tableFooterFilename);
 
 	pfree(tableFooterFilename->data);
 	pfree(tableFooterFilename);
 
-	tableFile = AllocateFile(filename, PG_BINARY_R);
-	if (tableFile == NULL)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not open file \"%s\" for reading: %m",
-							   filename)));
+	ret = rados_stat(*ioctx, tableFilename->data, NULL, NULL);
+	if (ret) {
+		ereport(ERROR, (errmsg("could not open table file: ret=%d", ret)));
 	}
 
 	/*
@@ -181,7 +181,7 @@ CStoreBeginRead(const char *filename, rados_t *rados, rados_ioctx_t *ioctx,
 											  ALLOCSET_DEFAULT_MAXSIZE);
 
 	readState = palloc0(sizeof(TableReadState));
-	readState->tableFile = tableFile;
+	readState->tableFilename = tableFilename;
 	readState->tableFooter = tableFooter;
 	readState->projectedColumnList = projectedColumnList;
 	readState->whereClauseList = whereClauseList;
@@ -232,7 +232,7 @@ CStoreReadNextRow(TableReadState *readState, Datum *columnValues, bool *columnNu
 		MemoryContextReset(readState->stripeReadContext);
 
 		stripeMetadata = list_nth(stripeMetadataList, readState->readStripeCount);
-		stripeData = LoadFilteredStripeData(readState->tableFile, stripeMetadata,
+		stripeData = LoadFilteredStripeData(readState, stripeMetadata,
 											readState->tupleDescriptor,
 											readState->projectedColumnList,
 											readState->whereClauseList);
@@ -279,7 +279,6 @@ CStoreEndRead(TableReadState *readState)
 		rados_shutdown(*readState->rados);
 
 	MemoryContextDelete(readState->stripeReadContext);
-	FreeFile(readState->tableFile);
 	list_free_deep(readState->tableFooter->stripeMetadataList);
 	pfree(readState->tableFooter);
 	pfree(readState);
@@ -292,7 +291,7 @@ CStoreEndRead(TableReadState *readState)
  * and only loads columns that are projected in the query.
  */
 static StripeData *
-LoadFilteredStripeData(FILE *tableFile, StripeMetadata *stripeMetadata,
+LoadFilteredStripeData(TableReadState *readState, StripeMetadata *stripeMetadata,
 					   TupleDesc tupleDescriptor, List *projectedColumnList,
 					   List *whereClauseList)
 {
@@ -303,9 +302,9 @@ LoadFilteredStripeData(FILE *tableFile, StripeMetadata *stripeMetadata,
 	Form_pg_attribute *attributeFormArray = tupleDescriptor->attrs;
 	uint32 columnCount = tupleDescriptor->natts;
 
-	StripeFooter *stripeFooter = LoadStripeFooter(tableFile, stripeMetadata,
+	StripeFooter *stripeFooter = LoadStripeFooter(readState, stripeMetadata,
 												  columnCount);
-	StripeSkipList *stripeSkipList = LoadStripeSkipList(tableFile, stripeMetadata,
+	StripeSkipList *stripeSkipList = LoadStripeSkipList(readState, stripeMetadata,
 														stripeFooter, columnCount,
 														attributeFormArray);
 
@@ -334,7 +333,7 @@ LoadFilteredStripeData(FILE *tableFile, StripeMetadata *stripeMetadata,
 			Form_pg_attribute attributeForm = attributeFormArray[columnIndex];
 			uint32 blockCount = selectedBlockSkipList->blockCount;
 
-			ColumnData *columnData = LoadColumnData(tableFile, blockSkipNode, blockCount,
+			ColumnData *columnData = LoadColumnData(readState, blockSkipNode, blockCount,
 													existsFileOffset, valueFileOffset,
 													attributeForm);
 
@@ -391,7 +390,7 @@ ReadStripeNextRow(StripeData *stripeData, List *projectedColumnList,
  * and lengths are retrieved from the column block skip node array.
  */
 static ColumnData *
-LoadColumnData(FILE *tableFile, ColumnBlockSkipNode *blockSkipNodeArray,
+LoadColumnData(TableReadState *readState, ColumnBlockSkipNode *blockSkipNodeArray,
 			   uint32 blockCount, uint64 existsFileOffset, uint64 valueFileOffset,
 			   Form_pg_attribute attributeForm)
 {
@@ -400,6 +399,8 @@ LoadColumnData(FILE *tableFile, ColumnBlockSkipNode *blockSkipNodeArray,
 	const bool typeByValue = attributeForm->attbyval;
 	const int typeLength = attributeForm->attlen;
 	const char typeAlign = attributeForm->attalign;
+	rados_ioctx_t *ioctx = readState->ioctx;
+	StringInfo tableFilename = readState->tableFilename;
 
 	ColumnBlockData **blockDataArray = palloc0(blockCount * sizeof(ColumnBlockData *));
 	for (blockIndex = 0; blockIndex < blockCount; blockIndex++)
@@ -417,8 +418,8 @@ LoadColumnData(FILE *tableFile, ColumnBlockSkipNode *blockSkipNodeArray,
 		ColumnBlockSkipNode *blockSkipNode = &blockSkipNodeArray[blockIndex];
 		uint32 rowCount = blockSkipNode->rowCount;
 		uint64 existsOffset = existsFileOffset + blockSkipNode->existsBlockOffset;
-		StringInfo rawExistsBuffer = ReadFromFile(tableFile, existsOffset,
-												  blockSkipNode->existsLength);
+		StringInfo rawExistsBuffer = ReadFromObject(ioctx, tableFilename->data,
+				existsOffset, blockSkipNode->existsLength);
 
 		bool *existsArray = DeserializeBoolArray(rawExistsBuffer, rowCount);
 		blockDataArray[blockIndex]->existsArray = existsArray;
@@ -431,8 +432,8 @@ LoadColumnData(FILE *tableFile, ColumnBlockSkipNode *blockSkipNodeArray,
 		uint32 rowCount = blockSkipNode->rowCount;
 		bool *existsArray = blockDataArray[blockIndex]->existsArray;
 		uint64 valueOffset = valueFileOffset + blockSkipNode->valueBlockOffset;
-		StringInfo rawValueBuffer = ReadFromFile(tableFile, valueOffset,
-												 blockSkipNode->valueLength);
+		StringInfo rawValueBuffer = ReadFromObject(ioctx, tableFilename->data,
+				valueOffset, blockSkipNode->valueLength);
 		StringInfo valueBuffer = DecompressBuffer(rawValueBuffer,
 												  blockSkipNode->valueCompressionType);
 
@@ -451,18 +452,20 @@ LoadColumnData(FILE *tableFile, ColumnBlockSkipNode *blockSkipNodeArray,
 
 /* Reads and returns the given stripe's footer. */
 static StripeFooter *
-LoadStripeFooter(FILE *tableFile, StripeMetadata *stripeMetadata,
+LoadStripeFooter(TableReadState *readState, StripeMetadata *stripeMetadata,
 				 uint32 columnCount)
 {
 	StripeFooter *stripeFooter = NULL;
 	StringInfo footerBuffer = NULL;
 	uint64 footerOffset = 0;
+	rados_ioctx_t *ioctx = readState->ioctx;
+	StringInfo tableFilename = readState->tableFilename;
 
 	footerOffset += stripeMetadata->fileOffset;
 	footerOffset += stripeMetadata->skipListLength;
 	footerOffset += stripeMetadata->dataLength;
 
-	footerBuffer = ReadFromFile(tableFile, footerOffset, stripeMetadata->footerLength);
+	footerBuffer = ReadFromObject(ioctx, tableFilename->data, footerOffset, stripeMetadata->footerLength);
 	stripeFooter = DeserializeStripeFooter(footerBuffer);
 	if (stripeFooter->columnCount != columnCount)
 	{
@@ -476,7 +479,7 @@ LoadStripeFooter(FILE *tableFile, StripeMetadata *stripeMetadata,
 
 /* Reads the skip list for the given stripe. */
 static StripeSkipList *
-LoadStripeSkipList(FILE *tableFile, StripeMetadata *stripeMetadata,
+LoadStripeSkipList(TableReadState *readState, StripeMetadata *stripeMetadata,
 				   StripeFooter *stripeFooter, uint32 columnCount,
 				   Form_pg_attribute *attributeFormArray)
 {
@@ -486,10 +489,12 @@ LoadStripeSkipList(FILE *tableFile, StripeMetadata *stripeMetadata,
 	uint64 currentColumnSkipListFileOffset = 0;
 	uint32 columnIndex = 0;
 	uint32 stripeBlockCount = 0;
+	rados_ioctx_t *ioctx = readState->ioctx;
+	StringInfo tableFilename = readState->tableFilename;
 
 	/* deserialize block count */
-	firstColumnSkipListBuffer = ReadFromFile(tableFile, stripeMetadata->fileOffset,
-											 stripeFooter->skipListSizeArray[0]);
+	firstColumnSkipListBuffer = ReadFromObject(ioctx, tableFilename->data,
+			stripeMetadata->fileOffset, stripeFooter->skipListSizeArray[0]);
 	stripeBlockCount = DeserializeBlockCount(firstColumnSkipListBuffer);
 
 	/* deserialize column skip lists */
@@ -502,7 +507,7 @@ LoadStripeSkipList(FILE *tableFile, StripeMetadata *stripeMetadata,
 		Form_pg_attribute attributeForm = attributeFormArray[columnIndex];
 
 		StringInfo columnSkipListBuffer =
-			ReadFromFile(tableFile, currentColumnSkipListFileOffset, columnSkipListSize);
+			ReadFromObject(ioctx, tableFilename->data, currentColumnSkipListFileOffset, columnSkipListSize);
 
 		ColumnBlockSkipNode *columnSkipList =
 			DeserializeColumnSkipList(columnSkipListBuffer, attributeForm->attbyval,
@@ -939,48 +944,6 @@ DeserializeDatumArray(StringInfo datumBuffer, bool *existsArray, uint32 datumCou
 
 	return datumArray;
 }
-
-/* Reads the given segment from the given file. */
-static StringInfo
-ReadFromFile(FILE *file, uint64 offset, uint32 size)
-{
-	int fseekResult = 0;
-	int freadResult = 0;
-	int fileError = 0;
-
-	StringInfo resultBuffer = makeStringInfo();
-	enlargeStringInfo(resultBuffer, size);
-	resultBuffer->len = size;
-
-	if (size == 0)
-	{
-		return resultBuffer;
-	}
-
-	errno = 0;
-	fseekResult = fseeko(file, offset, SEEK_SET);
-	if (fseekResult != 0)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not seek in file: %m")));
-	}
-
-	freadResult = fread(resultBuffer->data, size, 1, file);
-	if (freadResult != 1)
-	{
-		ereport(ERROR, (errmsg("could not read enough data from file")));
-	}
-
-	fileError = ferror(file);
-	if (fileError != 0)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not read file: %m")));
-	}
-
-	return resultBuffer;
-}
-
 
 /*
  * DecompressBuffer decompresses the given buffer with the given compression

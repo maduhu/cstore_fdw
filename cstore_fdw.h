@@ -229,7 +229,6 @@ typedef struct StripeFooter
 /* TableReadState represents state of a cstore file read operation. */
 typedef struct TableReadState
 {
-	FILE *tableFile;
 	TableFooter *tableFooter;
 	TupleDesc tupleDescriptor;
 
@@ -242,6 +241,7 @@ typedef struct TableReadState
 
   rados_t *rados;
   rados_ioctx_t *ioctx;
+  StringInfo tableFilename;
 
 	List *whereClauseList;
 	MemoryContext stripeReadContext;
@@ -256,7 +256,6 @@ typedef struct TableReadState
 /* TableWriteState represents state of a cstore file write operation. */
 typedef struct TableWriteState
 {
-	FILE *tableFile;
 	TableFooter *tableFooter;
   StringInfo tableFilename;
 	StringInfo tableFooterFilename;
