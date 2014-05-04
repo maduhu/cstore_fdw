@@ -258,13 +258,14 @@ typedef struct TableWriteState
 {
 	FILE *tableFile;
 	TableFooter *tableFooter;
+  StringInfo tableFilename;
 	StringInfo tableFooterFilename;
 	CompressionType compressionType;
 	TupleDesc tupleDescriptor;
 	FmgrInfo **comparisonFunctionArray;
 	uint64 currentFileOffset;
 
-	rados_t rados;
+  rados_ioctx_t *ioctx;
 
 	MemoryContext stripeWriteContext;
 	StripeData *stripeData;

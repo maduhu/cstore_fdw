@@ -133,10 +133,14 @@ CStoreBeginWrite(const char *filename, rados_ioctx_t *ioctx,
 	uint64 currentFileOffset = 0;
 	uint32 columnCount = 0;
 	uint32 columnIndex = 0;
+	StringInfo tableFilename = NULL;
 	int ret;
 
 	tableFooterFilename = makeStringInfo();
 	appendStringInfo(tableFooterFilename, "%s%s", filename, CSTORE_FOOTER_FILE_SUFFIX);
+
+	tableFilename = makeStringInfo();
+	appendStringInfo(tableFilename, "%s", filename);
 
 	ret = rados_stat(*ioctx, tableFooterFilename->data, NULL, NULL);
 	if (ret) {
@@ -227,6 +231,7 @@ CStoreBeginWrite(const char *filename, rados_ioctx_t *ioctx,
 
 	writeState = palloc0(sizeof(TableWriteState));
 	writeState->tableFile = tableFile;
+	writeState->tableFilename = tableFilename;
 	writeState->tableFooterFilename = tableFooterFilename;
 	writeState->tableFooter = tableFooter;
 	writeState->compressionType = compressionType;
@@ -237,6 +242,7 @@ CStoreBeginWrite(const char *filename, rados_ioctx_t *ioctx,
 	writeState->stripeData = NULL;
 	writeState->stripeSkipList = NULL;
 	writeState->stripeWriteContext = stripeWriteContext;
+	writeState->ioctx = ioctx;
 
 	return writeState;
 }
@@ -475,6 +481,9 @@ FlushStripe(TableWriteState *writeState)
 	TupleDesc tupleDescriptor = writeState->tupleDescriptor;
 	uint32 columnCount = tupleDescriptor->natts;
 	uint32 blockCount = stripeSkipList->blockCount;
+	StringInfo tableFilename = writeState->tableFilename;
+	rados_ioctx_t *ioctx = writeState->ioctx;
+	uint64 objoffset = writeState->currentFileOffset;
 
 	/* create "exists" and "value" buffers */
 	existsBufferArray = CreateExistsBufferArray(stripeData->columnDataArray,
@@ -582,6 +591,10 @@ FlushStripe(TableWriteState *writeState)
 	{
 		StringInfo skipListBuffer = skipListBufferArray[columnIndex];
 		WriteToFile(tableFile, skipListBuffer->data, skipListBuffer->len);
+
+		WriteToObject(ioctx, tableFilename->data, skipListBuffer->data,
+				skipListBuffer->len, objoffset);
+		objoffset += skipListBuffer->len;
 	}
 
 	/* then, we flush the data buffers */
@@ -592,17 +605,30 @@ FlushStripe(TableWriteState *writeState)
 		{
 			StringInfo existsBuffer = existsBufferArray[columnIndex][blockIndex];
 			WriteToFile(tableFile, existsBuffer->data, existsBuffer->len);
+
+			WriteToObject(ioctx, tableFilename->data, existsBuffer->data,
+					existsBuffer->len, objoffset);
+			objoffset += existsBuffer->len;
 		}
 
 		for (blockIndex = 0; blockIndex < stripeSkipList->blockCount; blockIndex++)
 		{
 			StringInfo valueBuffer = valueBufferArray[columnIndex][blockIndex];
 			WriteToFile(tableFile, valueBuffer->data, valueBuffer->len);
+
+			WriteToObject(ioctx, tableFilename->data, valueBuffer->data,
+					valueBuffer->len, objoffset);
+			objoffset += valueBuffer->len;
 		}
 	}
 
 	/* finally, we flush the footer buffer */
 	WriteToFile(tableFile, stripeFooterBuffer->data, stripeFooterBuffer->len);
+
+	WriteToObject(ioctx, tableFilename->data, stripeFooterBuffer->data,
+			stripeFooterBuffer->len, objoffset);
+	objoffset += stripeFooterBuffer->len;
+
 
 	/* set stripe metadata */
 	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
