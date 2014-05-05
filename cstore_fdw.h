@@ -23,7 +23,7 @@
 
 
 /* Defines for valid option names */
-#define OPTION_NAME_FILENAME "filename"
+#define OPTION_NAME_OBJPREFIX "objprefix"
 #define OPTION_NAME_COMPRESSION_TYPE "compression"
 #define OPTION_NAME_STRIPE_ROW_COUNT "stripe_row_count"
 #define OPTION_NAME_BLOCK_ROW_COUNT "block_row_count"
@@ -54,7 +54,6 @@
 /* miscellaneous defines */
 #define CSTORE_FDW_NAME "cstore_fdw"
 #define CSTORE_FOOTER_FILE_SUFFIX ".footer"
-#define CSTORE_TEMP_FILE_SUFFIX ".tmp"
 #define CSTORE_TUPLE_COST_MULTIPLIER 10
 #define CSTORE_POSTSCRIPT_SIZE_LENGTH 1
 #define CSTORE_POSTSCRIPT_SIZE_MAX 256
@@ -78,7 +77,7 @@ static const uint32 ValidOptionCount = 6;
 static const CStoreValidOption ValidOptionArray[] =
 {
 	/* foreign table options */
-	{ OPTION_NAME_FILENAME, ForeignTableRelationId },
+	{ OPTION_NAME_OBJPREFIX, ForeignTableRelationId },
 	{ OPTION_NAME_COMPRESSION_TYPE, ForeignTableRelationId },
 	{ OPTION_NAME_STRIPE_ROW_COUNT, ForeignTableRelationId },
 	{ OPTION_NAME_BLOCK_ROW_COUNT, ForeignTableRelationId },
@@ -106,7 +105,7 @@ typedef enum
  */
 typedef struct CStoreFdwOptions
 {
-	char *filename;
+	char *objprefix;
 	CompressionType compressionType;
 	uint64 stripeRowCount;
 	uint32 blockRowCount;

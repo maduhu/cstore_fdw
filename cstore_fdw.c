@@ -66,8 +66,8 @@ static void CStoreGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
 static ForeignScan * CStoreGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 										  Oid foreignTableId, ForeignPath *bestPath,
 										  List *targetList, List *scanClauses);
-static double TupleCountEstimate(RelOptInfo *baserel, const char *filename);
-static BlockNumber PageCount(const char *filename);
+static double TupleCountEstimate(RelOptInfo *baserel, const char *objprefix, rados_ioctx_t *ioctx);
+static BlockNumber PageCount(const char *objprefix, rados_ioctx_t *ioctx);
 static List * ColumnList(RelOptInfo *baserel);
 static void CStoreExplainForeignScan(ForeignScanState *scanState,
 									 ExplainState *explainState);
@@ -114,7 +114,6 @@ void _PG_fini(void)
 {
 	ProcessUtility_hook = PreviousProcessUtilityHook;
 }
-
 
 /*
  * CStoreProcessUtility is the hook for handling utility commands. This function
@@ -310,7 +309,7 @@ CopyIntoCStoreTable(const CopyStmt *copyStatement, const char *queryString)
 							  copyStatement->options);
 
 	/* init state to write to the cstore file */
-	writeState = CStoreBeginWrite(cstoreFdwOptions->filename, ioctx,
+	writeState = CStoreBeginWrite(cstoreFdwOptions->objprefix, ioctx,
 			cstoreFdwOptions->compressionType,
 			cstoreFdwOptions->stripeRowCount,
 			cstoreFdwOptions->blockRowCount,
@@ -380,7 +379,7 @@ cstore_fdw_validator(PG_FUNCTION_ARGS)
 	Oid optionContextId = PG_GETARG_OID(1);
 	List *optionList = untransformRelOptions(optionArray);
 	ListCell *optionCell = NULL;
-	char *filename = NULL;
+	char *objprefix = NULL;
 	char *compressionTypeString = NULL;
 	char *stripeRowCountString = NULL;
 	char *blockRowCountString = NULL;
@@ -417,9 +416,9 @@ cstore_fdw_validator(PG_FUNCTION_ARGS)
 									optionNamesString->data)));
 		}
 
-		if (strncmp(optionName, OPTION_NAME_FILENAME, NAMEDATALEN) == 0)
+		if (strncmp(optionName, OPTION_NAME_OBJPREFIX, NAMEDATALEN) == 0)
 		{
-			filename = defGetString(optionDef);
+			objprefix = defGetString(optionDef);
 		}
 		else if (strncmp(optionName, OPTION_NAME_CEPH_CONF_FILE, NAMEDATALEN) == 0)
 		{
@@ -445,7 +444,7 @@ cstore_fdw_validator(PG_FUNCTION_ARGS)
 
 	if (optionContextId == ForeignTableRelationId)
 	{
-		ValidateForeignTableOptions(filename, ceph_conf_file, ceph_pool_name,
+		ValidateForeignTableOptions(objprefix, ceph_conf_file, ceph_pool_name,
 				compressionTypeString, stripeRowCountString, blockRowCountString);
 	}
 
@@ -496,7 +495,7 @@ static CStoreFdwOptions *
 CStoreGetOptions(Oid foreignTableId)
 {
 	CStoreFdwOptions *cstoreFdwOptions = NULL;
-	char *filename = NULL;
+	char *objprefix = NULL;
 	CompressionType compressionType = DEFAULT_COMPRESSION_TYPE;
 	int32 stripeRowCount = DEFAULT_STRIPE_ROW_COUNT;
 	int32 blockRowCount = DEFAULT_BLOCK_ROW_COUNT;
@@ -506,7 +505,7 @@ CStoreGetOptions(Oid foreignTableId)
 	char *ceph_conf_file;
 	char *ceph_pool_name;
 
-	filename = CStoreGetOptionValue(foreignTableId, OPTION_NAME_FILENAME);
+	objprefix = CStoreGetOptionValue(foreignTableId, OPTION_NAME_OBJPREFIX);
 	ceph_conf_file = CStoreGetOptionValue(foreignTableId, OPTION_NAME_CEPH_CONF_FILE);
 	ceph_pool_name = CStoreGetOptionValue(foreignTableId, OPTION_NAME_CEPH_POOL_NAME);
 	compressionTypeString = CStoreGetOptionValue(foreignTableId,
@@ -516,7 +515,7 @@ CStoreGetOptions(Oid foreignTableId)
 	blockRowCountString = CStoreGetOptionValue(foreignTableId,
 											   OPTION_NAME_BLOCK_ROW_COUNT);
 
-	ValidateForeignTableOptions(filename, ceph_conf_file, ceph_pool_name,
+	ValidateForeignTableOptions(objprefix, ceph_conf_file, ceph_pool_name,
 			compressionTypeString, stripeRowCountString, blockRowCountString);
 
 	/* parse provided options */
@@ -534,7 +533,7 @@ CStoreGetOptions(Oid foreignTableId)
 	}
 
 	cstoreFdwOptions = palloc0(sizeof(CStoreFdwOptions));
-	cstoreFdwOptions->filename = filename;
+	cstoreFdwOptions->objprefix = objprefix;
 	cstoreFdwOptions->compressionType = compressionType;
 	cstoreFdwOptions->stripeRowCount = stripeRowCount;
 	cstoreFdwOptions->blockRowCount = blockRowCount;
@@ -587,14 +586,14 @@ CStoreGetOptionValue(Oid foreignTableId, const char *optionName)
  * considered invalid.
  */
 static void
-ValidateForeignTableOptions(char *filename, char *ceph_conf_file, char *ceph_pool_name,
+ValidateForeignTableOptions(char *objprefix, char *ceph_conf_file, char *ceph_pool_name,
 		char *compressionTypeString, char *stripeRowCountString, char *blockRowCountString)
 {
-	/* check if filename is specified */
-	if (filename == NULL)
+	/* check if objprefix is specified */
+	if (objprefix == NULL)
 	{
 		ereport(ERROR, (errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
-						errmsg("filename is required for cstore foreign tables")));
+						errmsg("objprefix is required for cstore foreign tables")));
 	}
 
 	if (!ceph_conf_file) {
@@ -679,12 +678,45 @@ static void
 CStoreGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId)
 {
 	CStoreFdwOptions *cstoreFdwOptions = CStoreGetOptions(foreignTableId);
-	double tupleCountEstimate = TupleCountEstimate(baserel, cstoreFdwOptions->filename);
-	double rowSelectivity = clauselist_selectivity(root, baserel->baserestrictinfo,
+	double tupleCountEstimate, rowSelectivity, outputRowCount;
+	rados_t rados;
+	rados_ioctx_t ioctx;
+	int ret;
+
+	ret = rados_create(&rados, "admin");
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not create rados cluster object: ret=%d", ret)));
+	}
+
+	ret = rados_conf_read_file(rados, cstoreFdwOptions->ceph_conf_file);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not read ceph conf file: ret=%d", ret)));
+	}
+
+	ret = rados_connect(rados);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("xcould not connect to ceph: ret=%d", ret)));
+	}
+
+	ret = rados_ioctx_create(rados, cstoreFdwOptions->ceph_pool_name, &ioctx);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not open ceph pool: %s ret=%d",
+				cstoreFdwOptions->ceph_pool_name, ret)));
+	}
+
+	tupleCountEstimate = TupleCountEstimate(baserel, cstoreFdwOptions->objprefix, &ioctx);
+	rowSelectivity = clauselist_selectivity(root, baserel->baserestrictinfo,
 												   0, JOIN_INNER, NULL);
 
-	double outputRowCount = clamp_row_est(tupleCountEstimate * rowSelectivity);
+	outputRowCount = clamp_row_est(tupleCountEstimate * rowSelectivity);
 	baserel->rows = outputRowCount;
+
+	rados_ioctx_destroy(ioctx);
+	rados_shutdown(rados);
 }
 
 
@@ -699,6 +731,47 @@ CStoreGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId
 {
 	Path *foreignScanPath = NULL;
 	CStoreFdwOptions *cstoreFdwOptions = CStoreGetOptions(foreignTableId);
+	List *queryColumnList;
+	uint32 queryColumnCount;
+	BlockNumber relationPageCount;
+	uint32 relationColumnCount;
+	double queryColumnRatio;
+	double queryPageCount;
+	double totalDiskAccessCost;
+	double tupleCountEstimate;
+	double filterCostPerTuple;
+	double cpuCostPerTuple;
+	double totalCpuCost;
+	double startupCost;
+	double totalCost;
+	rados_t rados;
+	rados_ioctx_t ioctx;
+	int ret;
+
+	ret = rados_create(&rados, "admin");
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not create rados cluster object: ret=%d", ret)));
+	}
+
+	ret = rados_conf_read_file(rados, cstoreFdwOptions->ceph_conf_file);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not read ceph conf file: ret=%d", ret)));
+	}
+
+	ret = rados_connect(rados);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("xcould not connect to ceph: ret=%d", ret)));
+	}
+
+	ret = rados_ioctx_create(rados, cstoreFdwOptions->ceph_pool_name, &ioctx);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not open ceph pool: %s ret=%d",
+				cstoreFdwOptions->ceph_pool_name, ret)));
+	}
 
 	/*
 	 * We skip reading columns that are not in query. Here we assume that all
@@ -716,27 +789,27 @@ CStoreGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId
 	 * algorithm and using the correlation statistics to detect which columns
 	 * are in stored in sorted order.
 	 */
-	List *queryColumnList = ColumnList(baserel);
-	uint32 queryColumnCount = list_length(queryColumnList);
-	BlockNumber relationPageCount = PageCount(cstoreFdwOptions->filename);
-	uint32 relationColumnCount = baserel->max_attr - baserel->min_attr + 1;
+	queryColumnList = ColumnList(baserel);
+	queryColumnCount = list_length(queryColumnList);
+	relationPageCount = PageCount(cstoreFdwOptions->objprefix, &ioctx);
+	relationColumnCount = baserel->max_attr - baserel->min_attr + 1;
 
-	double queryColumnRatio = (double) queryColumnCount / relationColumnCount;
-	double queryPageCount = relationPageCount * queryColumnRatio;
-	double totalDiskAccessCost = seq_page_cost * queryPageCount;
+	queryColumnRatio = (double) queryColumnCount / relationColumnCount;
+	queryPageCount = relationPageCount * queryColumnRatio;
+	totalDiskAccessCost = seq_page_cost * queryPageCount;
 
-	double tupleCountEstimate = TupleCountEstimate(baserel, cstoreFdwOptions->filename);
+	tupleCountEstimate = TupleCountEstimate(baserel, cstoreFdwOptions->objprefix, &ioctx);
 
 	/*
 	 * We estimate costs almost the same way as cost_seqscan(), thus assuming
 	 * that I/O costs are equivalent to a regular table file of the same size.
 	 */
-	double filterCostPerTuple = baserel->baserestrictcost.per_tuple;
-	double cpuCostPerTuple = cpu_tuple_cost + filterCostPerTuple;
-	double totalCpuCost = cpuCostPerTuple * tupleCountEstimate;
+	filterCostPerTuple = baserel->baserestrictcost.per_tuple;
+	cpuCostPerTuple = cpu_tuple_cost + filterCostPerTuple;
+	totalCpuCost = cpuCostPerTuple * tupleCountEstimate;
 
-	double startupCost = baserel->baserestrictcost.startup;
-	double totalCost  = startupCost + totalCpuCost + totalDiskAccessCost;
+	startupCost = baserel->baserestrictcost.startup;
+	totalCost  = startupCost + totalCpuCost + totalDiskAccessCost;
 
 	/* create a foreign path node and add it as the only possible path */
 	foreignScanPath = (Path *) create_foreignscan_path(root, baserel, baserel->rows,
@@ -746,6 +819,9 @@ CStoreGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId
 													   NIL); /* no fdw_private */
 
 	add_path(baserel, foreignScanPath);
+
+	rados_ioctx_destroy(ioctx);
+	rados_shutdown(rados);
 }
 
 
@@ -794,7 +870,7 @@ CStoreGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId,
  * file.
  */
 static double
-TupleCountEstimate(RelOptInfo *baserel, const char *filename)
+TupleCountEstimate(RelOptInfo *baserel, const char *objprefix, rados_ioctx_t *ioctx)
 {
 	double tupleCountEstimate = 0.0;
 
@@ -807,7 +883,7 @@ TupleCountEstimate(RelOptInfo *baserel, const char *filename)
 		 * that by the current file size.
 		 */
 		double tupleDensity = baserel->tuples / (double) baserel->pages;
-		BlockNumber pageCount = PageCount(filename);
+		BlockNumber pageCount = PageCount(objprefix, ioctx);
 
 		tupleCountEstimate = clamp_row_est(tupleDensity * (double) pageCount);
 	}
@@ -818,18 +894,18 @@ TupleCountEstimate(RelOptInfo *baserel, const char *filename)
 		 * planner's idea of relation width, which may be inaccurate. For better
 		 * estimates, users need to run ANALYZE.
 		 */
-		struct stat statBuffer;
+		uint64 size;
 		int tupleWidth = 0;
 
-		int statResult = stat(filename, &statBuffer);
-		if (statResult < 0)
+		int ret = rados_stat(*ioctx, objprefix, &size, NULL);
+		if (ret < 0)
 		{
 			/* file may not be there at plan time, so use a default estimate */
-			statBuffer.st_size = 10 * BLCKSZ;
+			size = 10 * BLCKSZ;
 		}
 
 		tupleWidth = MAXALIGN(baserel->width) + MAXALIGN(sizeof(HeapTupleHeaderData));
-		tupleCountEstimate = (double) statBuffer.st_size / (double) tupleWidth;
+		tupleCountEstimate = (double) size / (double) tupleWidth;
 		tupleCountEstimate = clamp_row_est(tupleCountEstimate);
 	}
 
@@ -839,19 +915,19 @@ TupleCountEstimate(RelOptInfo *baserel, const char *filename)
 
 /* PageCount calculates and returns the number of pages in a file. */
 static BlockNumber
-PageCount(const char *filename)
+PageCount(const char *objprefix, rados_ioctx_t *ioctx)
 {
 	BlockNumber pageCount = 0;
-	struct stat statBuffer;
+	uint64 size;
 
 	/* if file doesn't exist at plan time, use default estimate for its size */
-	int statResult = stat(filename, &statBuffer);
-	if (statResult < 0)
+	int ret = rados_stat(*ioctx, objprefix, &size, NULL);
+	if (ret < 0)
 	{
-		statBuffer.st_size = 10 * BLCKSZ;
+		size = 10 * BLCKSZ;
 	}
 
-	pageCount = (statBuffer.st_size + (BLCKSZ - 1)) / BLCKSZ;
+	pageCount = (size + (BLCKSZ - 1)) / BLCKSZ;
 	if (pageCount < 1)
 	{
 		pageCount = 1;
@@ -929,21 +1005,52 @@ CStoreExplainForeignScan(ForeignScanState *scanState, ExplainState *explainState
 {
 	Oid foreignTableId = RelationGetRelid(scanState->ss.ss_currentRelation);
 	CStoreFdwOptions *cstoreFdwOptions = CStoreGetOptions(foreignTableId);
+	rados_t rados;
+	rados_ioctx_t ioctx;
+	int ret;
 
-	ExplainPropertyText("CStore File", cstoreFdwOptions->filename, explainState);
+	ret = rados_create(&rados, "admin");
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not create rados cluster object: ret=%d", ret)));
+	}
+
+	ret = rados_conf_read_file(rados, cstoreFdwOptions->ceph_conf_file);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not read ceph conf file: ret=%d", ret)));
+	}
+
+	ret = rados_connect(rados);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("xcould not connect to ceph: ret=%d", ret)));
+	}
+
+	ret = rados_ioctx_create(rados, cstoreFdwOptions->ceph_pool_name, &ioctx);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not open ceph pool: %s ret=%d",
+				cstoreFdwOptions->ceph_pool_name, ret)));
+	}
+
+	ExplainPropertyText("CStore File", cstoreFdwOptions->objprefix, explainState);
 
 	/* supress file size if we're not showing cost details */
 	if (explainState->costs)
 	{
-		struct stat statBuffer;
+		uint64 size;
 
-		int statResult = stat(cstoreFdwOptions->filename, &statBuffer);
-		if (statResult == 0)
+		int ret = rados_stat(ioctx, cstoreFdwOptions->objprefix, &size, NULL);
+		if (ret == 0)
 		{
-			ExplainPropertyLong("CStore File Size", (long) statBuffer.st_size,
+			ExplainPropertyLong("CStore File Size", (long) size,
 								explainState);
 		}
 	}
+
+	rados_ioctx_destroy(ioctx);
+	rados_shutdown(rados);
 }
 
 
@@ -1005,7 +1112,7 @@ CStoreBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	whereClauseList = foreignScan->scan.plan.qual;
 
 	columnList = (List *) linitial(foreignPrivateList);
-	readState = CStoreBeginRead(cstoreFdwOptions->filename, rados, ioctx,
+	readState = CStoreBeginRead(cstoreFdwOptions->objprefix, rados, ioctx,
 			tupleDescriptor, columnList, whereClauseList);
 
 	scanState->fdw_state = (void *) readState;
@@ -1077,17 +1184,44 @@ CStoreAnalyzeForeignTable(Relation relation,
 {
 	Oid foreignTableId = RelationGetRelid(relation);
 	CStoreFdwOptions *cstoreFdwOptions = CStoreGetOptions(foreignTableId);
-	struct stat statBuffer;
+	rados_t rados;
+	rados_ioctx_t ioctx;
+	uint64 size;
+	int ret;
 
-	int statResult = stat(cstoreFdwOptions->filename, &statBuffer);
-	if (statResult < 0)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not stat file \"%s\": %m",
-							   cstoreFdwOptions->filename)));
+	ret = rados_create(&rados, "admin");
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not create rados cluster object: ret=%d", ret)));
 	}
 
-	(*totalPageCount) = PageCount(cstoreFdwOptions->filename);
+	ret = rados_conf_read_file(rados, cstoreFdwOptions->ceph_conf_file);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not read ceph conf file: ret=%d", ret)));
+	}
+
+	ret = rados_connect(rados);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("xcould not connect to ceph: ret=%d", ret)));
+	}
+
+	ret = rados_ioctx_create(rados, cstoreFdwOptions->ceph_pool_name, &ioctx);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not open ceph pool: %s ret=%d",
+				cstoreFdwOptions->ceph_pool_name, ret)));
+	}
+
+	ret = rados_stat(ioctx, cstoreFdwOptions->objprefix, &size, NULL);
+	if (ret < 0)
+	{
+		ereport(ERROR, (errmsg("could not stat file \"%s\": %m",
+							   cstoreFdwOptions->objprefix)));
+	}
+
+	(*totalPageCount) = PageCount(cstoreFdwOptions->objprefix, &ioctx);
 	(*acquireSampleRowsFunc) = CStoreAcquireSampleRows;
 
 	return true;

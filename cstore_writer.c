@@ -117,7 +117,7 @@ CStoreWriteFooter(rados_ioctx_t *ioctx, StringInfo tableFooterFilename, TableFoo
  * will be added.
  */
 TableWriteState *
-CStoreBeginWrite(const char *filename, rados_ioctx_t *ioctx,
+CStoreBeginWrite(const char *objprefix, rados_ioctx_t *ioctx,
 		CompressionType compressionType,
 		uint64 stripeMaxRowCount, uint32 blockRowCount,
 		TupleDesc tupleDescriptor)
@@ -134,14 +134,14 @@ CStoreBeginWrite(const char *filename, rados_ioctx_t *ioctx,
 	int ret;
 
 	tableFooterFilename = makeStringInfo();
-	appendStringInfo(tableFooterFilename, "%s%s", filename, CSTORE_FOOTER_FILE_SUFFIX);
+	appendStringInfo(tableFooterFilename, "%s%s", objprefix, CSTORE_FOOTER_FILE_SUFFIX);
 
 	tableFilename = makeStringInfo();
-	appendStringInfo(tableFilename, "%s", filename);
+	appendStringInfo(tableFilename, "%s", objprefix);
 
 	ret = rados_stat(*ioctx, tableFooterFilename->data, NULL, NULL);
 	if (ret) {
-		ret = rados_write_full(*ioctx, filename, NULL, 0);
+		ret = rados_write_full(*ioctx, objprefix, NULL, 0);
 		if (ret) {
 			ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
 				errmsg("could not create table file: ret=%d", ret)));
@@ -151,7 +151,7 @@ CStoreBeginWrite(const char *filename, rados_ioctx_t *ioctx,
 		tableFooter->blockRowCount = blockRowCount;
 		tableFooter->stripeMetadataList = NIL;
 	} else {
-		ret = rados_stat(*ioctx, filename, NULL, NULL);
+		ret = rados_stat(*ioctx, objprefix, NULL, NULL);
 		if (ret) {
 			ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
 				errmsg("table file not found: ret=%d", ret)));
