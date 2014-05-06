@@ -141,22 +141,25 @@ CStoreBeginWrite(const char *objprefix, rados_ioctx_t *ioctx,
 
 	ret = rados_stat(*ioctx, tableFooterFilename->data, NULL, NULL);
 	if (ret) {
+#if 0
 		ret = rados_write_full(*ioctx, objprefix, NULL, 0);
 		if (ret) {
 			ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
 				errmsg("could not create table file: ret=%d", ret)));
 		}
+#endif
 
 		tableFooter = palloc0(sizeof(TableFooter));
 		tableFooter->blockRowCount = blockRowCount;
 		tableFooter->stripeMetadataList = NIL;
 	} else {
+#if 0
 		ret = rados_stat(*ioctx, objprefix, NULL, NULL);
 		if (ret) {
 			ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
 				errmsg("table file not found: ret=%d", ret)));
 		}
-
+#endif
 		tableFooter = CStoreReadFooter(ioctx, tableFooterFilename);
 	}
 
@@ -449,7 +452,23 @@ FlushStripe(TableWriteState *writeState)
 	uint32 blockCount = stripeSkipList->blockCount;
 	StringInfo tableFilename = writeState->tableFilename;
 	rados_ioctx_t *ioctx = writeState->ioctx;
-	uint64 objoffset = writeState->currentFileOffset;
+	uint64 fileoffset = writeState->currentFileOffset;
+	uint64 objoffset = 0;
+	StringInfo objname = NULL;
+	int ret;
+
+	/*
+	 * A stripe is uniquely identified by its starting offset in the file.
+	 * To make things simple we are going to use that offset to create
+	 * object names of the form prefix.offset.
+	 */
+	objname = makeStringInfo();
+	appendStringInfo(objname, "%s.%llu", tableFilename->data, (long long)fileoffset);
+
+	ret = rados_trunc(*ioctx, objname->data, 0);
+	if (ret) {
+		ereport(ERROR, (errmsg("failed to truncate stripe obj: ret=%d", ret)));
+	}
 
 	/* create "exists" and "value" buffers */
 	existsBufferArray = CreateExistsBufferArray(stripeData->columnDataArray,
@@ -556,7 +575,7 @@ FlushStripe(TableWriteState *writeState)
 	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
 	{
 		StringInfo skipListBuffer = skipListBufferArray[columnIndex];
-		WriteToObject(ioctx, tableFilename->data, skipListBuffer->data,
+		WriteToObject(ioctx, objname->data, skipListBuffer->data,
 				skipListBuffer->len, objoffset);
 		objoffset += skipListBuffer->len;
 	}
@@ -568,7 +587,7 @@ FlushStripe(TableWriteState *writeState)
 		for (blockIndex = 0; blockIndex < stripeSkipList->blockCount; blockIndex++)
 		{
 			StringInfo existsBuffer = existsBufferArray[columnIndex][blockIndex];
-			WriteToObject(ioctx, tableFilename->data, existsBuffer->data,
+			WriteToObject(ioctx, objname->data, existsBuffer->data,
 					existsBuffer->len, objoffset);
 			objoffset += existsBuffer->len;
 		}
@@ -576,14 +595,14 @@ FlushStripe(TableWriteState *writeState)
 		for (blockIndex = 0; blockIndex < stripeSkipList->blockCount; blockIndex++)
 		{
 			StringInfo valueBuffer = valueBufferArray[columnIndex][blockIndex];
-			WriteToObject(ioctx, tableFilename->data, valueBuffer->data,
+			WriteToObject(ioctx, objname->data, valueBuffer->data,
 					valueBuffer->len, objoffset);
 			objoffset += valueBuffer->len;
 		}
 	}
 
 	/* finally, we flush the footer buffer */
-	WriteToObject(ioctx, tableFilename->data, stripeFooterBuffer->data,
+	WriteToObject(ioctx, objname->data, stripeFooterBuffer->data,
 			stripeFooterBuffer->len, objoffset);
 	objoffset += stripeFooterBuffer->len;
 
