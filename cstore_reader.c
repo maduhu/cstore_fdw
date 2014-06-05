@@ -116,6 +116,7 @@ CStoreBeginRead(const char *filename, rados_t *rados, rados_ioctx_t *ioctx,
 	StringInfo tableFooterFilename = makeStringInfo();
 	appendStringInfo(tableFooterFilename, "%s%s", filename, CSTORE_FOOTER_FILE_SUFFIX);
 
+	/* FIXME; remove*/
 	tableFilename = makeStringInfo();
 	appendStringInfo(tableFilename, "%s", filename);
 
@@ -354,13 +355,18 @@ LoadStripeFooter(TableReadState *readState, StripeMetadata *stripeMetadata,
 	StringInfo tableFilename = readState->tableFilename;
 	StringInfo objname;
 
+	/*
+	 * FIXME: if we aren't using the stripe footer offset, we can remove
+	 * it from the structs.
+	 */
 	objname = makeStringInfo();
-	appendStringInfo(objname, "%s.%llu", tableFilename->data, (long long)stripeMetadata->fileOffset);
+	appendStringInfo(objname, "%s.off-%llu.footer", tableFilename->data,
+			(long long)stripeMetadata->fileOffset);
 
 	footerOffset += stripeMetadata->skipListLength;
 	footerOffset += stripeMetadata->dataLength;
 
-	footerBuffer = ReadFromObject(ioctx, objname->data, footerOffset, stripeMetadata->footerLength);
+	footerBuffer = ReadFromObject(ioctx, objname->data, 0, stripeMetadata->footerLength);
 	stripeFooter = DeserializeStripeFooter(footerBuffer);
 	if (stripeFooter->columnCount != columnCount)
 	{

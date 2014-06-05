@@ -512,6 +512,7 @@ FlushStripe(TableWriteState *writeState)
 	uint64 objoffset = 0;
 	StringInfo objname = NULL;
 	StringInfo *columnObjNames;
+	StringInfo stripeFooterObjName;
 	uint64 *columnObjOffsets;
 	int ret;
 
@@ -702,19 +703,30 @@ FlushStripe(TableWriteState *writeState)
 		}
 	}
 
+	/*
+	 * FIXME: remove this as we now store the footer in a separate obj,
+	 * but we do create a hole as we need to make sure all the offsets are
+	 * correct to maintain backwards compat during development and
+	 * transition away from the current format.
+	 */
+#if 0
 	/* finally, we flush the footer buffer */
 	WriteToObject(ioctx, objname->data, stripeFooterBuffer->data,
 			stripeFooterBuffer->len, objoffset);
+#endif
 	objoffset += stripeFooterBuffer->len;
 
 	/*
-	 * FIXME: here we are putting the footer on column 0. Need to fix this
-	 * later with a different storage layout.
+	 * FIXME: writes the stripe footer to a separate object to simplify
+	 * stuff (we don't need to know the offset). Hopefully we can
+	 * eventually remove it altogether, but it exists at this point to
+	 * make sure we don't have to change too much of the arch.
 	 */
-	WriteToObject(ioctx, columnObjNames[0]->data, stripeFooterBuffer->data,
-			stripeFooterBuffer->len, columnObjOffsets[0]);
-	columnObjOffsets[0] += stripeFooterBuffer->len;
-
+	stripeFooterObjName = makeStringInfo();
+	appendStringInfo(stripeFooterObjName, "%s.off-%llu.footer",
+			tableFilename->data, (long long)fileoffset);
+	WriteToObject(ioctx, stripeFooterObjName->data, stripeFooterBuffer->data,
+			stripeFooterBuffer->len, 0);
 
 	/* set stripe metadata */
 	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
