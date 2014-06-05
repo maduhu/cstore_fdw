@@ -43,46 +43,6 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
-
-/* local functions forward declarations */
-static void CStoreProcessUtility(Node *parseTree, const char *queryString,
-								 ProcessUtilityContext context,
-								 ParamListInfo paramListInfo,
-								 DestReceiver *destReceiver, char *completionTag);
-static bool CStoreTable(RangeVar *rangeVar);
-static uint64 CopyIntoCStoreTable(const CopyStmt *copyStatement,
-								  const char *queryString);
-static StringInfo OptionNamesString(Oid currentContextId);
-static CStoreFdwOptions * CStoreGetOptions(Oid foreignTableId);
-static char * CStoreGetOptionValue(Oid foreignTableId, const char *optionName);
-static void ValidateForeignTableOptions(char *filename, char *ceph_conf_file,
-		char *ceph_pool_name, char *compressionTypeString,
-		char *stripeRowCountString, char *blockRowCountString);
-static CompressionType ParseCompressionType(const char *compressionTypeString);
-static void CStoreGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
-									Oid foreignTableId);
-static void CStoreGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
-								  Oid foreignTableId);
-static ForeignScan * CStoreGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
-										  Oid foreignTableId, ForeignPath *bestPath,
-										  List *targetList, List *scanClauses);
-static double TupleCountEstimate(RelOptInfo *baserel, const char *objprefix, rados_ioctx_t *ioctx);
-static BlockNumber PageCount(const char *objprefix, rados_ioctx_t *ioctx);
-static List * ColumnList(RelOptInfo *baserel);
-static void CStoreExplainForeignScan(ForeignScanState *scanState,
-									 ExplainState *explainState);
-static void CStoreBeginForeignScan(ForeignScanState *scanState, int executorFlags);
-static TupleTableSlot * CStoreIterateForeignScan(ForeignScanState *scanState);
-static void CStoreEndForeignScan(ForeignScanState *scanState);
-static void CStoreReScanForeignScan(ForeignScanState *scanState);
-static bool CStoreAnalyzeForeignTable(Relation relation,
-									  AcquireSampleRowsFunc *acquireSampleRowsFunc,
-									  BlockNumber *totalPageCount);
-static int CStoreAcquireSampleRows(Relation relation, int logLevel,
-								   HeapTuple *sampleRows, int targetRowCount,
-								   double *totalRowCount, double *totalDeadRowCount);
-
-
 /* declarations for dynamic loading */
 PG_MODULE_MAGIC;
 
@@ -93,72 +53,37 @@ PG_FUNCTION_INFO_V1(cstore_fdw_validator);
 /* saved hook value in case of unload */
 static ProcessUtility_hook_type PreviousProcessUtilityHook = NULL;
 
-
 /*
- * _PG_init is called when the module is loaded. In this function we save the
- * previous utility hook, and then install our hook to pre-intercept calls to
- * the copy command.
+ * OptionNamesString finds all options that are valid for the current context,
+ * and concatenates these option names in a comma separated string. The function
+ * is unchanged from mongo_fdw.
  */
-void _PG_init(void)
+static StringInfo
+OptionNamesString(Oid currentContextId)
 {
-	PreviousProcessUtilityHook = ProcessUtility_hook;
-	ProcessUtility_hook = CStoreProcessUtility;
-}
+	StringInfo optionNamesString = makeStringInfo();
+	bool firstOptionAppended = false;
 
-
-/*
- * _PG_fini is called when the module is unloaded. This function uninstalls the
- * extension's hooks.
- */
-void _PG_fini(void)
-{
-	ProcessUtility_hook = PreviousProcessUtilityHook;
-}
-
-/*
- * CStoreProcessUtility is the hook for handling utility commands. This function
- * intercepts "COPY cstore_table FROM" statements, and redirectes execution to
- * CopyIntoCStoreTable function. For all other utility statements, the function
- * calls the previous utility hook or the standard utility command.
- */
-static void
-CStoreProcessUtility(Node *parseTree, const char *queryString,
-					 ProcessUtilityContext context, ParamListInfo paramListInfo,
-					 DestReceiver *destReceiver, char *completionTag)
-{
-	bool copyIntoCStoreTable = false;
-
-	/* check if the statement is a "COPY cstore_table FROM ..." statement */
-	if (nodeTag(parseTree) == T_CopyStmt)
+	int32 optionIndex = 0;
+	for (optionIndex = 0; optionIndex < ValidOptionCount; optionIndex++)
 	{
-		CopyStmt *copyStatement = (CopyStmt *) parseTree;
-		if (copyStatement->is_from && CStoreTable(copyStatement->relation))
+		const CStoreValidOption *validOption = &(ValidOptionArray[optionIndex]);
+
+		/* if option belongs to current context, append option name */
+		if (currentContextId == validOption->optionContextId)
 		{
-			copyIntoCStoreTable = true;
+			if (firstOptionAppended)
+			{
+				appendStringInfoString(optionNamesString, ", ");
+			}
+
+			appendStringInfoString(optionNamesString, validOption->optionName);
+			firstOptionAppended = true;
 		}
 	}
 
-	if (copyIntoCStoreTable)
-	{
-		uint64 processed = CopyIntoCStoreTable((CopyStmt *) parseTree, queryString);
-		if (completionTag != NULL)
-		{
-			snprintf(completionTag, COMPLETION_TAG_BUFSIZE,
-					 "COPY " UINT64_FORMAT, processed);
-		}
-	}
-	else if (PreviousProcessUtilityHook != NULL)
-	{
-		PreviousProcessUtilityHook(parseTree, queryString, context, paramListInfo,
-								   destReceiver, completionTag);
-	}
-	else
-	{
-		standard_ProcessUtility(parseTree, queryString, context, paramListInfo,
-								destReceiver, completionTag);
-	}
+	return optionNamesString;
 }
-
 
 /*
  * CStoreTable checks if the given table name belongs to a foreign columnar store
@@ -189,6 +114,189 @@ CStoreTable(RangeVar *rangeVar)
 
 	return cstoreTable;
 }
+
+/*
+ * CStoreGetOptionValue walks over foreign table and foreign server options, and
+ * looks for the option with the given name. If found, the function returns the
+ * option's value. This function is unchanged from mongo_fdw.
+ */
+static char *
+CStoreGetOptionValue(Oid foreignTableId, const char *optionName)
+{
+	ForeignTable *foreignTable = NULL;
+	ForeignServer *foreignServer = NULL;
+	List *optionList = NIL;
+	ListCell *optionCell = NULL;
+	char *optionValue = NULL;
+
+	foreignTable = GetForeignTable(foreignTableId);
+	foreignServer = GetForeignServer(foreignTable->serverid);
+
+	optionList = list_concat(optionList, foreignTable->options);
+	optionList = list_concat(optionList, foreignServer->options);
+
+	foreach(optionCell, optionList)
+	{
+		DefElem *optionDef = (DefElem *) lfirst(optionCell);
+		char *optionDefName = optionDef->defname;
+
+		if (strncmp(optionDefName, optionName, NAMEDATALEN) == 0)
+		{
+			optionValue = defGetString(optionDef);
+			break;
+		}
+	}
+
+	return optionValue;
+}
+
+/* ParseCompressionType converts a string to a compression type. */
+static CompressionType
+ParseCompressionType(const char *compressionTypeString)
+{
+	CompressionType compressionType = COMPRESSION_TYPE_INVALID;
+	Assert(compressionTypeString != NULL);
+
+	if (strncmp(compressionTypeString, COMPRESSION_STRING_NONE, NAMEDATALEN) == 0)
+	{
+		compressionType = COMPRESSION_NONE;
+	}
+	else if (strncmp(compressionTypeString, COMPRESSION_STRING_PG_LZ, NAMEDATALEN) == 0)
+	{
+		compressionType = COMPRESSION_PG_LZ;
+	}
+
+	return compressionType;
+}
+
+/*
+ * ValidateForeignTableOptions verifies if given options are valid cstore_fdw
+ * foreign table options. This function errors out if given option value is
+ * considered invalid.
+ */
+static void
+ValidateForeignTableOptions(char *objprefix, char *ceph_conf_file, char *ceph_pool_name,
+		char *compressionTypeString, char *stripeRowCountString, char *blockRowCountString)
+{
+	/* check if objprefix is specified */
+	if (objprefix == NULL)
+	{
+		ereport(ERROR, (errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
+						errmsg("objprefix is required for cstore foreign tables")));
+	}
+
+	if (!ceph_conf_file) {
+		ereport(ERROR, (errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
+						errmsg("ceph conf file is required for cstore foreign tables")));
+	}
+
+	if (!ceph_pool_name) {
+		ereport(ERROR, (errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
+						errmsg("ceph pool name is required for cstore foreign tables")));
+	}
+
+	/* check if the provided compression type is valid */
+	if (compressionTypeString != NULL)
+	{
+		CompressionType compressionType = ParseCompressionType(compressionTypeString);
+		if (compressionType == COMPRESSION_TYPE_INVALID)
+		{
+			ereport(ERROR, (errmsg("invalid compression type"),
+							errhint("Valid options are: %s",
+									COMPRESSION_STRING_DELIMITED_LIST)));
+		}
+	}
+
+	/* check if the provided stripe row count has correct format and range */
+	if (stripeRowCountString != NULL)
+	{
+		/* pg_atoi() errors out if the given string is not a valid 32-bit integer */
+		int32 stripeRowCount = pg_atoi(stripeRowCountString, sizeof(int32), 0);
+		if (stripeRowCount < STRIPE_ROW_COUNT_MINIMUM ||
+			stripeRowCount > STRIPE_ROW_COUNT_MAXIMUM)
+		{
+			ereport(ERROR, (errmsg("invalid stripe row count"),
+							errhint("Stripe row count must be an integer between "
+									"%d and %d", STRIPE_ROW_COUNT_MINIMUM,
+									STRIPE_ROW_COUNT_MAXIMUM)));
+		}
+	}
+
+	/* check if the provided block row count has correct format and range */
+	if (blockRowCountString != NULL)
+	{
+		/* pg_atoi() errors out if the given string is not a valid 32-bit integer */
+		int32 blockRowCount = pg_atoi(blockRowCountString, sizeof(int32), 0);
+		if (blockRowCount < BLOCK_ROW_COUNT_MINIMUM ||
+			blockRowCount > BLOCK_ROW_COUNT_MAXIMUM)
+		{
+			ereport(ERROR, (errmsg("invalid block row count"),
+							errhint("Block row count must be an integer between "
+									"%d and %d", BLOCK_ROW_COUNT_MINIMUM,
+									BLOCK_ROW_COUNT_MAXIMUM)));
+		}
+	}
+}
+
+
+/*
+ * CStoreGetOptions returns the option values to be used when reading and writing
+ * the cstore file. To resolve these values, the function checks options for the
+ * foreign table, and if not present, falls back to default values. This function
+ * errors out if given option values are considered invalid.
+ */
+static CStoreFdwOptions *
+CStoreGetOptions(Oid foreignTableId)
+{
+	CStoreFdwOptions *cstoreFdwOptions = NULL;
+	char *objprefix = NULL;
+	CompressionType compressionType = DEFAULT_COMPRESSION_TYPE;
+	int32 stripeRowCount = DEFAULT_STRIPE_ROW_COUNT;
+	int32 blockRowCount = DEFAULT_BLOCK_ROW_COUNT;
+	char *compressionTypeString = NULL;
+	char *stripeRowCountString = NULL;
+	char *blockRowCountString = NULL;
+	char *ceph_conf_file;
+	char *ceph_pool_name;
+
+	objprefix = CStoreGetOptionValue(foreignTableId, OPTION_NAME_OBJPREFIX);
+	ceph_conf_file = CStoreGetOptionValue(foreignTableId, OPTION_NAME_CEPH_CONF_FILE);
+	ceph_pool_name = CStoreGetOptionValue(foreignTableId, OPTION_NAME_CEPH_POOL_NAME);
+	compressionTypeString = CStoreGetOptionValue(foreignTableId,
+												 OPTION_NAME_COMPRESSION_TYPE);
+	stripeRowCountString = CStoreGetOptionValue(foreignTableId,
+												OPTION_NAME_STRIPE_ROW_COUNT);
+	blockRowCountString = CStoreGetOptionValue(foreignTableId,
+											   OPTION_NAME_BLOCK_ROW_COUNT);
+
+	ValidateForeignTableOptions(objprefix, ceph_conf_file, ceph_pool_name,
+			compressionTypeString, stripeRowCountString, blockRowCountString);
+
+	/* parse provided options */
+	if (compressionTypeString != NULL)
+	{
+		compressionType = ParseCompressionType(compressionTypeString);
+	}
+	if (stripeRowCountString != NULL)
+	{
+		stripeRowCount = pg_atoi(stripeRowCountString, sizeof(int32), 0);
+	}
+	if (blockRowCountString != NULL)
+	{
+		blockRowCount = pg_atoi(blockRowCountString, sizeof(int32), 0);
+	}
+
+	cstoreFdwOptions = palloc0(sizeof(CStoreFdwOptions));
+	cstoreFdwOptions->objprefix = objprefix;
+	cstoreFdwOptions->compressionType = compressionType;
+	cstoreFdwOptions->stripeRowCount = stripeRowCount;
+	cstoreFdwOptions->blockRowCount = blockRowCount;
+	cstoreFdwOptions->ceph_conf_file = ceph_conf_file;
+	cstoreFdwOptions->ceph_pool_name = ceph_pool_name;
+
+	return cstoreFdwOptions;
+}
+
 
 
 /*
@@ -343,30 +451,6 @@ CopyIntoCStoreTable(const CopyStmt *copyStatement, const char *queryString)
 	return processedRowCount;
 }
 
-
-/*
- * cstore_fdw_handler creates and returns a struct with pointers to foreign
- * table callback functions.
- */
-Datum
-cstore_fdw_handler(PG_FUNCTION_ARGS)
-{
-	FdwRoutine *fdwRoutine = makeNode(FdwRoutine);
-
-	fdwRoutine->GetForeignRelSize = CStoreGetForeignRelSize;
-	fdwRoutine->GetForeignPaths = CStoreGetForeignPaths;
-	fdwRoutine->GetForeignPlan = CStoreGetForeignPlan;
-	fdwRoutine->ExplainForeignScan = CStoreExplainForeignScan;
-	fdwRoutine->BeginForeignScan = CStoreBeginForeignScan;
-	fdwRoutine->IterateForeignScan = CStoreIterateForeignScan;
-	fdwRoutine->ReScanForeignScan = CStoreReScanForeignScan;
-	fdwRoutine->EndForeignScan = CStoreEndForeignScan;
-	fdwRoutine->AnalyzeForeignTable = CStoreAnalyzeForeignTable;
-
-	PG_RETURN_POINTER(fdwRoutine);
-}
-
-
 /*
  * cstore_fdw_validator validates options given to one of the following commands:
  * foreign data wrapper, server, user mapping, or foreign table. This function
@@ -451,224 +535,75 @@ cstore_fdw_validator(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+/* PageCount calculates and returns the number of pages in a file. */
+static BlockNumber
+PageCount(const char *objprefix, rados_ioctx_t *ioctx)
+{
+	BlockNumber pageCount = 0;
+	uint64 size;
+
+	/* if file doesn't exist at plan time, use default estimate for its size */
+	int ret = rados_stat(*ioctx, objprefix, &size, NULL);
+	if (ret < 0)
+	{
+		size = 10 * BLCKSZ;
+	}
+
+	pageCount = (size + (BLCKSZ - 1)) / BLCKSZ;
+	if (pageCount < 1)
+	{
+		pageCount = 1;
+	}
+
+	return pageCount;
+}
 
 /*
- * OptionNamesString finds all options that are valid for the current context,
- * and concatenates these option names in a comma separated string. The function
- * is unchanged from mongo_fdw.
+ * TupleCountEstimate estimates the number of base relation tuples in the given
+ * file.
  */
-static StringInfo
-OptionNamesString(Oid currentContextId)
+static double
+TupleCountEstimate(RelOptInfo *baserel, const char *objprefix, rados_ioctx_t *ioctx)
 {
-	StringInfo optionNamesString = makeStringInfo();
-	bool firstOptionAppended = false;
+	double tupleCountEstimate = 0.0;
 
-	int32 optionIndex = 0;
-	for (optionIndex = 0; optionIndex < ValidOptionCount; optionIndex++)
+	/* check if the user executed Analyze on this foreign table before */
+	if (baserel->pages > 0)
 	{
-		const CStoreValidOption *validOption = &(ValidOptionArray[optionIndex]);
+		/*
+		 * We have number of pages and number of tuples from pg_class (from a
+		 * previous ANALYZE), so compute a tuples-per-page estimate and scale
+		 * that by the current file size.
+		 */
+		double tupleDensity = baserel->tuples / (double) baserel->pages;
+		BlockNumber pageCount = PageCount(objprefix, ioctx);
 
-		/* if option belongs to current context, append option name */
-		if (currentContextId == validOption->optionContextId)
+		tupleCountEstimate = clamp_row_est(tupleDensity * (double) pageCount);
+	}
+	else
+	{
+		/*
+		 * Otherwise we have to fake it. We back into this estimate using the
+		 * planner's idea of relation width, which may be inaccurate. For better
+		 * estimates, users need to run ANALYZE.
+		 */
+		uint64 size;
+		int tupleWidth = 0;
+
+		int ret = rados_stat(*ioctx, objprefix, &size, NULL);
+		if (ret < 0)
 		{
-			if (firstOptionAppended)
-			{
-				appendStringInfoString(optionNamesString, ", ");
-			}
-
-			appendStringInfoString(optionNamesString, validOption->optionName);
-			firstOptionAppended = true;
+			/* file may not be there at plan time, so use a default estimate */
+			size = 10 * BLCKSZ;
 		}
+
+		tupleWidth = MAXALIGN(baserel->width) + MAXALIGN(sizeof(HeapTupleHeaderData));
+		tupleCountEstimate = (double) size / (double) tupleWidth;
+		tupleCountEstimate = clamp_row_est(tupleCountEstimate);
 	}
 
-	return optionNamesString;
+	return tupleCountEstimate;
 }
-
-
-/*
- * CStoreGetOptions returns the option values to be used when reading and writing
- * the cstore file. To resolve these values, the function checks options for the
- * foreign table, and if not present, falls back to default values. This function
- * errors out if given option values are considered invalid.
- */
-static CStoreFdwOptions *
-CStoreGetOptions(Oid foreignTableId)
-{
-	CStoreFdwOptions *cstoreFdwOptions = NULL;
-	char *objprefix = NULL;
-	CompressionType compressionType = DEFAULT_COMPRESSION_TYPE;
-	int32 stripeRowCount = DEFAULT_STRIPE_ROW_COUNT;
-	int32 blockRowCount = DEFAULT_BLOCK_ROW_COUNT;
-	char *compressionTypeString = NULL;
-	char *stripeRowCountString = NULL;
-	char *blockRowCountString = NULL;
-	char *ceph_conf_file;
-	char *ceph_pool_name;
-
-	objprefix = CStoreGetOptionValue(foreignTableId, OPTION_NAME_OBJPREFIX);
-	ceph_conf_file = CStoreGetOptionValue(foreignTableId, OPTION_NAME_CEPH_CONF_FILE);
-	ceph_pool_name = CStoreGetOptionValue(foreignTableId, OPTION_NAME_CEPH_POOL_NAME);
-	compressionTypeString = CStoreGetOptionValue(foreignTableId,
-												 OPTION_NAME_COMPRESSION_TYPE);
-	stripeRowCountString = CStoreGetOptionValue(foreignTableId,
-												OPTION_NAME_STRIPE_ROW_COUNT);
-	blockRowCountString = CStoreGetOptionValue(foreignTableId,
-											   OPTION_NAME_BLOCK_ROW_COUNT);
-
-	ValidateForeignTableOptions(objprefix, ceph_conf_file, ceph_pool_name,
-			compressionTypeString, stripeRowCountString, blockRowCountString);
-
-	/* parse provided options */
-	if (compressionTypeString != NULL)
-	{
-		compressionType = ParseCompressionType(compressionTypeString);
-	}
-	if (stripeRowCountString != NULL)
-	{
-		stripeRowCount = pg_atoi(stripeRowCountString, sizeof(int32), 0);
-	}
-	if (blockRowCountString != NULL)
-	{
-		blockRowCount = pg_atoi(blockRowCountString, sizeof(int32), 0);
-	}
-
-	cstoreFdwOptions = palloc0(sizeof(CStoreFdwOptions));
-	cstoreFdwOptions->objprefix = objprefix;
-	cstoreFdwOptions->compressionType = compressionType;
-	cstoreFdwOptions->stripeRowCount = stripeRowCount;
-	cstoreFdwOptions->blockRowCount = blockRowCount;
-	cstoreFdwOptions->ceph_conf_file = ceph_conf_file;
-	cstoreFdwOptions->ceph_pool_name = ceph_pool_name;
-
-	return cstoreFdwOptions;
-}
-
-
-/*
- * CStoreGetOptionValue walks over foreign table and foreign server options, and
- * looks for the option with the given name. If found, the function returns the
- * option's value. This function is unchanged from mongo_fdw.
- */
-static char *
-CStoreGetOptionValue(Oid foreignTableId, const char *optionName)
-{
-	ForeignTable *foreignTable = NULL;
-	ForeignServer *foreignServer = NULL;
-	List *optionList = NIL;
-	ListCell *optionCell = NULL;
-	char *optionValue = NULL;
-
-	foreignTable = GetForeignTable(foreignTableId);
-	foreignServer = GetForeignServer(foreignTable->serverid);
-
-	optionList = list_concat(optionList, foreignTable->options);
-	optionList = list_concat(optionList, foreignServer->options);
-
-	foreach(optionCell, optionList)
-	{
-		DefElem *optionDef = (DefElem *) lfirst(optionCell);
-		char *optionDefName = optionDef->defname;
-
-		if (strncmp(optionDefName, optionName, NAMEDATALEN) == 0)
-		{
-			optionValue = defGetString(optionDef);
-			break;
-		}
-	}
-
-	return optionValue;
-}
-
-
-/*
- * ValidateForeignTableOptions verifies if given options are valid cstore_fdw
- * foreign table options. This function errors out if given option value is
- * considered invalid.
- */
-static void
-ValidateForeignTableOptions(char *objprefix, char *ceph_conf_file, char *ceph_pool_name,
-		char *compressionTypeString, char *stripeRowCountString, char *blockRowCountString)
-{
-	/* check if objprefix is specified */
-	if (objprefix == NULL)
-	{
-		ereport(ERROR, (errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
-						errmsg("objprefix is required for cstore foreign tables")));
-	}
-
-	if (!ceph_conf_file) {
-		ereport(ERROR, (errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
-						errmsg("ceph conf file is required for cstore foreign tables")));
-	}
-
-	if (!ceph_pool_name) {
-		ereport(ERROR, (errcode(ERRCODE_FDW_DYNAMIC_PARAMETER_VALUE_NEEDED),
-						errmsg("ceph pool name is required for cstore foreign tables")));
-	}
-
-	/* check if the provided compression type is valid */
-	if (compressionTypeString != NULL)
-	{
-		CompressionType compressionType = ParseCompressionType(compressionTypeString);
-		if (compressionType == COMPRESSION_TYPE_INVALID)
-		{
-			ereport(ERROR, (errmsg("invalid compression type"),
-							errhint("Valid options are: %s",
-									COMPRESSION_STRING_DELIMITED_LIST)));
-		}
-	}
-
-	/* check if the provided stripe row count has correct format and range */
-	if (stripeRowCountString != NULL)
-	{
-		/* pg_atoi() errors out if the given string is not a valid 32-bit integer */
-		int32 stripeRowCount = pg_atoi(stripeRowCountString, sizeof(int32), 0);
-		if (stripeRowCount < STRIPE_ROW_COUNT_MINIMUM ||
-			stripeRowCount > STRIPE_ROW_COUNT_MAXIMUM)
-		{
-			ereport(ERROR, (errmsg("invalid stripe row count"),
-							errhint("Stripe row count must be an integer between "
-									"%d and %d", STRIPE_ROW_COUNT_MINIMUM,
-									STRIPE_ROW_COUNT_MAXIMUM)));
-		}
-	}
-
-	/* check if the provided block row count has correct format and range */
-	if (blockRowCountString != NULL)
-	{
-		/* pg_atoi() errors out if the given string is not a valid 32-bit integer */
-		int32 blockRowCount = pg_atoi(blockRowCountString, sizeof(int32), 0);
-		if (blockRowCount < BLOCK_ROW_COUNT_MINIMUM ||
-			blockRowCount > BLOCK_ROW_COUNT_MAXIMUM)
-		{
-			ereport(ERROR, (errmsg("invalid block row count"),
-							errhint("Block row count must be an integer between "
-									"%d and %d", BLOCK_ROW_COUNT_MINIMUM,
-									BLOCK_ROW_COUNT_MAXIMUM)));
-		}
-	}
-}
-
-
-/* ParseCompressionType converts a string to a compression type. */
-static CompressionType
-ParseCompressionType(const char *compressionTypeString)
-{
-	CompressionType compressionType = COMPRESSION_TYPE_INVALID;
-	Assert(compressionTypeString != NULL);
-
-	if (strncmp(compressionTypeString, COMPRESSION_STRING_NONE, NAMEDATALEN) == 0)
-	{
-		compressionType = COMPRESSION_NONE;
-	}
-	else if (strncmp(compressionTypeString, COMPRESSION_STRING_PG_LZ, NAMEDATALEN) == 0)
-	{
-		compressionType = COMPRESSION_PG_LZ;
-	}
-
-	return compressionType;
-}
-
 
 /*
  * CStoreGetForeignRelSize obtains relation size estimates for a foreign table and
@@ -719,6 +654,66 @@ CStoreGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTable
 	rados_shutdown(rados);
 }
 
+/*
+ * ColumnList takes in the planner's information about this foreign table. The
+ * function then finds all columns needed for query execution, including those
+ * used in projections, joins, and filter clauses, de-duplicates these columns,
+ * and returns them in a new list. This function is unchanged from mongo_fdw.
+ */
+static List *
+ColumnList(RelOptInfo *baserel)
+{
+	List *columnList = NIL;
+	List *neededColumnList = NIL;
+	AttrNumber columnIndex = 1;
+	AttrNumber columnCount = baserel->max_attr;
+	List *targetColumnList = baserel->reltargetlist;
+	List *restrictInfoList = baserel->baserestrictinfo;
+	ListCell *restrictInfoCell = NULL;
+
+	/* first add the columns used in joins and projections */
+	neededColumnList = list_copy(targetColumnList);
+
+	/* then walk over all restriction clauses, and pull up any used columns */
+	foreach(restrictInfoCell, restrictInfoList)
+	{
+		RestrictInfo *restrictInfo = (RestrictInfo *) lfirst(restrictInfoCell);
+		Node *restrictClause = (Node *) restrictInfo->clause;
+		List *clauseColumnList = NIL;
+
+		/* recursively pull up any columns used in the restriction clause */
+		clauseColumnList = pull_var_clause(restrictClause,
+										   PVC_RECURSE_AGGREGATES,
+										   PVC_RECURSE_PLACEHOLDERS);
+
+		neededColumnList = list_union(neededColumnList, clauseColumnList);
+	}
+
+	/* walk over all column definitions, and de-duplicate column list */
+	for (columnIndex = 1; columnIndex <= columnCount; columnIndex++)
+	{
+		ListCell *neededColumnCell = NULL;
+		Var *column = NULL;
+
+		/* look for this column in the needed column list */
+		foreach(neededColumnCell, neededColumnList)
+		{
+			Var *neededColumn = (Var *) lfirst(neededColumnCell);
+			if (neededColumn->varattno == columnIndex)
+			{
+				column = neededColumn;
+				break;
+			}
+		}
+
+		if (column != NULL)
+		{
+			columnList = lappend(columnList, column);
+		}
+	}
+
+	return columnList;
+}
 
 /*
  * CStoreGetForeignPaths creates possible access paths for a scan on the foreign
@@ -863,141 +858,6 @@ CStoreGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId,
 
 	return foreignScan;
 }
-
-
-/*
- * TupleCountEstimate estimates the number of base relation tuples in the given
- * file.
- */
-static double
-TupleCountEstimate(RelOptInfo *baserel, const char *objprefix, rados_ioctx_t *ioctx)
-{
-	double tupleCountEstimate = 0.0;
-
-	/* check if the user executed Analyze on this foreign table before */
-	if (baserel->pages > 0)
-	{
-		/*
-		 * We have number of pages and number of tuples from pg_class (from a
-		 * previous ANALYZE), so compute a tuples-per-page estimate and scale
-		 * that by the current file size.
-		 */
-		double tupleDensity = baserel->tuples / (double) baserel->pages;
-		BlockNumber pageCount = PageCount(objprefix, ioctx);
-
-		tupleCountEstimate = clamp_row_est(tupleDensity * (double) pageCount);
-	}
-	else
-	{
-		/*
-		 * Otherwise we have to fake it. We back into this estimate using the
-		 * planner's idea of relation width, which may be inaccurate. For better
-		 * estimates, users need to run ANALYZE.
-		 */
-		uint64 size;
-		int tupleWidth = 0;
-
-		int ret = rados_stat(*ioctx, objprefix, &size, NULL);
-		if (ret < 0)
-		{
-			/* file may not be there at plan time, so use a default estimate */
-			size = 10 * BLCKSZ;
-		}
-
-		tupleWidth = MAXALIGN(baserel->width) + MAXALIGN(sizeof(HeapTupleHeaderData));
-		tupleCountEstimate = (double) size / (double) tupleWidth;
-		tupleCountEstimate = clamp_row_est(tupleCountEstimate);
-	}
-
-	return tupleCountEstimate;
-}
-
-
-/* PageCount calculates and returns the number of pages in a file. */
-static BlockNumber
-PageCount(const char *objprefix, rados_ioctx_t *ioctx)
-{
-	BlockNumber pageCount = 0;
-	uint64 size;
-
-	/* if file doesn't exist at plan time, use default estimate for its size */
-	int ret = rados_stat(*ioctx, objprefix, &size, NULL);
-	if (ret < 0)
-	{
-		size = 10 * BLCKSZ;
-	}
-
-	pageCount = (size + (BLCKSZ - 1)) / BLCKSZ;
-	if (pageCount < 1)
-	{
-		pageCount = 1;
-	}
-
-	return pageCount;
-}
-
-
-/*
- * ColumnList takes in the planner's information about this foreign table. The
- * function then finds all columns needed for query execution, including those
- * used in projections, joins, and filter clauses, de-duplicates these columns,
- * and returns them in a new list. This function is unchanged from mongo_fdw.
- */
-static List *
-ColumnList(RelOptInfo *baserel)
-{
-	List *columnList = NIL;
-	List *neededColumnList = NIL;
-	AttrNumber columnIndex = 1;
-	AttrNumber columnCount = baserel->max_attr;
-	List *targetColumnList = baserel->reltargetlist;
-	List *restrictInfoList = baserel->baserestrictinfo;
-	ListCell *restrictInfoCell = NULL;
-
-	/* first add the columns used in joins and projections */
-	neededColumnList = list_copy(targetColumnList);
-
-	/* then walk over all restriction clauses, and pull up any used columns */
-	foreach(restrictInfoCell, restrictInfoList)
-	{
-		RestrictInfo *restrictInfo = (RestrictInfo *) lfirst(restrictInfoCell);
-		Node *restrictClause = (Node *) restrictInfo->clause;
-		List *clauseColumnList = NIL;
-
-		/* recursively pull up any columns used in the restriction clause */
-		clauseColumnList = pull_var_clause(restrictClause,
-										   PVC_RECURSE_AGGREGATES,
-										   PVC_RECURSE_PLACEHOLDERS);
-
-		neededColumnList = list_union(neededColumnList, clauseColumnList);
-	}
-
-	/* walk over all column definitions, and de-duplicate column list */
-	for (columnIndex = 1; columnIndex <= columnCount; columnIndex++)
-	{
-		ListCell *neededColumnCell = NULL;
-		Var *column = NULL;
-
-		/* look for this column in the needed column list */
-		foreach(neededColumnCell, neededColumnList)
-		{
-			Var *neededColumn = (Var *) lfirst(neededColumnCell);
-			if (neededColumn->varattno == columnIndex)
-			{
-				column = neededColumn;
-				break;
-			}
-		}
-
-		if (column != NULL)
-		{
-			columnList = lappend(columnList, column);
-		}
-	}
-
-	return columnList;
-}
-
 
 /* CStoreExplainForeignScan produces extra output for the Explain command. */
 static void
@@ -1172,62 +1032,6 @@ CStoreReScanForeignScan(ForeignScanState *scanState)
 	CStoreBeginForeignScan(scanState, 0);
 }
 
-
-/*
- * CStoreAnalyzeForeignTable sets the total page count and the function pointer
- * used to acquire a random sample of rows from the foreign file.
- */
-static bool
-CStoreAnalyzeForeignTable(Relation relation,
-						  AcquireSampleRowsFunc *acquireSampleRowsFunc,
-						  BlockNumber *totalPageCount)
-{
-	Oid foreignTableId = RelationGetRelid(relation);
-	CStoreFdwOptions *cstoreFdwOptions = CStoreGetOptions(foreignTableId);
-	rados_t rados;
-	rados_ioctx_t ioctx;
-	uint64 size;
-	int ret;
-
-	ret = rados_create(&rados, "admin");
-	if (ret) {
-		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
-			errmsg("could not create rados cluster object: ret=%d", ret)));
-	}
-
-	ret = rados_conf_read_file(rados, cstoreFdwOptions->ceph_conf_file);
-	if (ret) {
-		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
-			errmsg("could not read ceph conf file: ret=%d", ret)));
-	}
-
-	ret = rados_connect(rados);
-	if (ret) {
-		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
-			errmsg("xcould not connect to ceph: ret=%d", ret)));
-	}
-
-	ret = rados_ioctx_create(rados, cstoreFdwOptions->ceph_pool_name, &ioctx);
-	if (ret) {
-		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
-			errmsg("could not open ceph pool: %s ret=%d",
-				cstoreFdwOptions->ceph_pool_name, ret)));
-	}
-
-	ret = rados_stat(ioctx, cstoreFdwOptions->objprefix, &size, NULL);
-	if (ret < 0)
-	{
-		ereport(ERROR, (errmsg("could not stat file \"%s\": %m",
-							   cstoreFdwOptions->objprefix)));
-	}
-
-	(*totalPageCount) = PageCount(cstoreFdwOptions->objprefix, &ioctx);
-	(*acquireSampleRowsFunc) = CStoreAcquireSampleRows;
-
-	return true;
-}
-
-
 /*
  * CStoreAcquireSampleRows acquires a random sample of rows from the foreign
  * table. Selected rows are returned in the caller allocated sampleRows array,
@@ -1398,3 +1202,146 @@ CStoreAcquireSampleRows(Relation relation, int logLevel,
 
 	return sampleRowCount;
 }
+
+
+/*
+ * CStoreAnalyzeForeignTable sets the total page count and the function pointer
+ * used to acquire a random sample of rows from the foreign file.
+ */
+static bool
+CStoreAnalyzeForeignTable(Relation relation,
+						  AcquireSampleRowsFunc *acquireSampleRowsFunc,
+						  BlockNumber *totalPageCount)
+{
+	Oid foreignTableId = RelationGetRelid(relation);
+	CStoreFdwOptions *cstoreFdwOptions = CStoreGetOptions(foreignTableId);
+	rados_t rados;
+	rados_ioctx_t ioctx;
+	uint64 size;
+	int ret;
+
+	ret = rados_create(&rados, "admin");
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not create rados cluster object: ret=%d", ret)));
+	}
+
+	ret = rados_conf_read_file(rados, cstoreFdwOptions->ceph_conf_file);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not read ceph conf file: ret=%d", ret)));
+	}
+
+	ret = rados_connect(rados);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("xcould not connect to ceph: ret=%d", ret)));
+	}
+
+	ret = rados_ioctx_create(rados, cstoreFdwOptions->ceph_pool_name, &ioctx);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not open ceph pool: %s ret=%d",
+				cstoreFdwOptions->ceph_pool_name, ret)));
+	}
+
+	ret = rados_stat(ioctx, cstoreFdwOptions->objprefix, &size, NULL);
+	if (ret < 0)
+	{
+		ereport(ERROR, (errmsg("could not stat file \"%s\": %m",
+							   cstoreFdwOptions->objprefix)));
+	}
+
+	(*totalPageCount) = PageCount(cstoreFdwOptions->objprefix, &ioctx);
+	(*acquireSampleRowsFunc) = CStoreAcquireSampleRows;
+
+	return true;
+}
+
+/*
+ * CStoreProcessUtility is the hook for handling utility commands. This function
+ * intercepts "COPY cstore_table FROM" statements, and redirectes execution to
+ * CopyIntoCStoreTable function. For all other utility statements, the function
+ * calls the previous utility hook or the standard utility command.
+ */
+static void
+CStoreProcessUtility(Node *parseTree, const char *queryString,
+					 ProcessUtilityContext context, ParamListInfo paramListInfo,
+					 DestReceiver *destReceiver, char *completionTag)
+{
+	bool copyIntoCStoreTable = false;
+
+	/* check if the statement is a "COPY cstore_table FROM ..." statement */
+	if (nodeTag(parseTree) == T_CopyStmt)
+	{
+		CopyStmt *copyStatement = (CopyStmt *) parseTree;
+		if (copyStatement->is_from && CStoreTable(copyStatement->relation))
+		{
+			copyIntoCStoreTable = true;
+		}
+	}
+
+	if (copyIntoCStoreTable)
+	{
+		uint64 processed = CopyIntoCStoreTable((CopyStmt *) parseTree, queryString);
+		if (completionTag != NULL)
+		{
+			snprintf(completionTag, COMPLETION_TAG_BUFSIZE,
+					 "COPY " UINT64_FORMAT, processed);
+		}
+	}
+	else if (PreviousProcessUtilityHook != NULL)
+	{
+		PreviousProcessUtilityHook(parseTree, queryString, context, paramListInfo,
+								   destReceiver, completionTag);
+	}
+	else
+	{
+		standard_ProcessUtility(parseTree, queryString, context, paramListInfo,
+								destReceiver, completionTag);
+	}
+}
+
+/*
+ * cstore_fdw_handler creates and returns a struct with pointers to foreign
+ * table callback functions.
+ */
+Datum
+cstore_fdw_handler(PG_FUNCTION_ARGS)
+{
+	FdwRoutine *fdwRoutine = makeNode(FdwRoutine);
+
+	fdwRoutine->GetForeignRelSize = CStoreGetForeignRelSize;
+	fdwRoutine->GetForeignPaths = CStoreGetForeignPaths;
+	fdwRoutine->GetForeignPlan = CStoreGetForeignPlan;
+	fdwRoutine->ExplainForeignScan = CStoreExplainForeignScan;
+	fdwRoutine->BeginForeignScan = CStoreBeginForeignScan;
+	fdwRoutine->IterateForeignScan = CStoreIterateForeignScan;
+	fdwRoutine->ReScanForeignScan = CStoreReScanForeignScan;
+	fdwRoutine->EndForeignScan = CStoreEndForeignScan;
+	fdwRoutine->AnalyzeForeignTable = CStoreAnalyzeForeignTable;
+
+	PG_RETURN_POINTER(fdwRoutine);
+}
+
+/*
+ * _PG_init is called when the module is loaded. In this function we save the
+ * previous utility hook, and then install our hook to pre-intercept calls to
+ * the copy command.
+ */
+void _PG_init(void)
+{
+	PreviousProcessUtilityHook = ProcessUtility_hook;
+	ProcessUtility_hook = CStoreProcessUtility;
+}
+
+
+/*
+ * _PG_fini is called when the module is unloaded. This function uninstalls the
+ * extension's hooks.
+ */
+void _PG_fini(void)
+{
+	ProcessUtility_hook = PreviousProcessUtilityHook;
+}
+
