@@ -31,34 +31,6 @@
 #include "utils/rel.h"
 #include <rados/librados.h>
 
-
-static StripeData * CreateEmptyStripeData(uint32 stripeMaxRowCount, uint32 blockRowCount,
-										  uint32 columnCount);
-static StripeSkipList * CreateEmptyStripeSkipList(uint32 stripeMaxRowCount,
-												  uint32 blockRowCount,
-												  uint32 columnCount);
-static StripeMetadata FlushStripe(TableWriteState *writeState);
-static StringInfo ** CreateExistsBufferArray(ColumnData **columnDataArray,
-											 StripeSkipList *stripeSkipList);
-static StringInfo ** CreateValueBufferArray(ColumnData **columnDataArray,
-											StripeSkipList *stripeSkipList,
-											TupleDesc tupleDescriptor);
-static StringInfo * CreateSkipListBufferArray(StripeSkipList *stripeSkipList,
-											  TupleDesc tupleDescriptor);
-static StripeFooter * CreateStripeFooter(StripeSkipList *stripeSkipList,
-										 StringInfo *skipListBufferArray);
-static StringInfo SerializeBoolArray(bool *boolArray, uint32 boolArrayLength);
-static StringInfo SerializeDatumArray(Datum *datumArray, bool *existsArray,
-									  uint32 datumCount, bool datumTypeByValue,
-									  int datumTypeLength, char datumTypeAlign);
-static void UpdateBlockSkipNodeMinMax(ColumnBlockSkipNode *blockSkipNode,
-									  Datum columnValue, bool columnTypeByValue,
-									  int columnTypeLength, Oid columnCollation,
-									  FmgrInfo *comparisonFunction);
-static Datum DatumCopy(Datum datum, bool datumTypeByValue, int datumTypeLength);
-static void AppendStripeMetadata(TableFooter *tableFooter,
-								 StripeMetadata stripeMetadata);
-
 static void
 WriteToObject(rados_ioctx_t *ioctx, const char *oid, void *data, uint32 dataLength, uint64 offset)
 {
@@ -204,136 +176,6 @@ CStoreBeginWrite(const char *objprefix, rados_ioctx_t *ioctx,
 	return writeState;
 }
 
-
-/*
- * CStoreWriteRow adds a row to the cstore file. If the stripe is not initialized,
- * we create structures to hold stripe data and skip list. Then, we add data for
- * each of the columns and update corresponding skip nodes. Then, if row count
- * exceeds stripeMaxRowCount, we flush the stripe, and add its metadata to the
- * table footer.
- */
-void
-CStoreWriteRow(TableWriteState *writeState, Datum *columnValues, bool *columnNulls)
-{
-	uint32 columnIndex = 0;
-	uint32 blockIndex = 0;
-	uint32 blockRowIndex = 0;
-	StripeData *stripeData = writeState->stripeData;
-	StripeSkipList *stripeSkipList = writeState->stripeSkipList;
-	uint32 columnCount = writeState->tupleDescriptor->natts;
-	TableFooter *tableFooter = writeState->tableFooter;
-	const uint32 blockRowCount = tableFooter->blockRowCount;
-
-	MemoryContext oldContext = MemoryContextSwitchTo(writeState->stripeWriteContext);
-
-	if (stripeData == NULL)
-	{
-		stripeData = CreateEmptyStripeData(writeState->stripeMaxRowCount,
-										   blockRowCount, columnCount);
-		stripeSkipList = CreateEmptyStripeSkipList(writeState->stripeMaxRowCount,
-												   blockRowCount, columnCount);
-		writeState->stripeData = stripeData;
-		writeState->stripeSkipList = stripeSkipList;
-	}
-
-	blockIndex = stripeData->rowCount / blockRowCount;
-	blockRowIndex = stripeData->rowCount % blockRowCount;
-
-	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
-	{
-		ColumnData *columnData = stripeData->columnDataArray[columnIndex];
-		ColumnBlockData *blockData = columnData->blockDataArray[blockIndex];
-		ColumnBlockSkipNode **blockSkipNodeArray = stripeSkipList->blockSkipNodeArray;
-		ColumnBlockSkipNode *blockSkipNode =
-			&blockSkipNodeArray[columnIndex][blockIndex];
-
-		if (columnNulls[columnIndex])
-		{
-			blockData->existsArray[blockRowIndex] = false;
-		}
-		else
-		{
-			FmgrInfo *comparisonFunction =
-				writeState->comparisonFunctionArray[columnIndex];
-			Form_pg_attribute attributeForm =
-				writeState->tupleDescriptor->attrs[columnIndex];
-			bool columnTypeByValue = attributeForm->attbyval;
-			int columnTypeLength = attributeForm->attlen;
-			Oid columnCollation = attributeForm->attcollation;
-
-			blockData->existsArray[blockRowIndex] = true;
-			blockData->valueArray[blockRowIndex] = DatumCopy(columnValues[columnIndex],
-															 columnTypeByValue,
-															 columnTypeLength);
-
-			UpdateBlockSkipNodeMinMax(blockSkipNode, columnValues[columnIndex],
-									  columnTypeByValue, columnTypeLength,
-									  columnCollation, comparisonFunction);
-		}
-
-		blockSkipNode->rowCount++;
-	}
-
-	stripeSkipList->blockCount = blockIndex + 1;
-	stripeData->rowCount++;
-	if (stripeData->rowCount >= writeState->stripeMaxRowCount)
-	{
-		StripeMetadata stripeMetadata = FlushStripe(writeState);
-		MemoryContextReset(writeState->stripeWriteContext);
-
-		/* set stripe data and skip list to NULL so they are recreated next time */
-		writeState->stripeData = NULL;
-		writeState->stripeSkipList = NULL;
-
-		/*
-		 * Append stripeMetadata in old context so next MemoryContextReset
-		 * doesn't free it.
-		 */
-		MemoryContextSwitchTo(oldContext);
-		AppendStripeMetadata(tableFooter, stripeMetadata);
-	}
-	else
-	{
-		MemoryContextSwitchTo(oldContext);
-	}
-}
-
-
-/*
- * CStoreEndWrite finishes a cstore data load operation. If we have an unflushed
- * stripe, we flush it. Then, we sync and close the cstore data file. Last, we
- * flush the footer to a temporary file, and atomically rename this temporary
- * file to the original footer file.
- */
-void
-CStoreEndWrite(rados_ioctx_t *ioctx, TableWriteState *writeState)
-{
-	StringInfo tableFooterFilename = NULL;
-
-	StripeData *stripeData = writeState->stripeData;
-	if (stripeData != NULL)
-	{
-		MemoryContext oldContext = MemoryContextSwitchTo(writeState->stripeWriteContext);
-
-		StripeMetadata stripeMetadata = FlushStripe(writeState);
-		MemoryContextReset(writeState->stripeWriteContext);
-
-		MemoryContextSwitchTo(oldContext);
-		AppendStripeMetadata(writeState->tableFooter, stripeMetadata);
-	}
-
-	tableFooterFilename = writeState->tableFooterFilename;
-	CStoreWriteFooter(ioctx, tableFooterFilename, writeState->tableFooter);
-
-	MemoryContextDelete(writeState->stripeWriteContext);
-	list_free_deep(writeState->tableFooter->stripeMetadataList);
-	pfree(writeState->tableFooter);
-	pfree(writeState->tableFooterFilename->data);
-	pfree(writeState->tableFooterFilename);
-	pfree(writeState->comparisonFunctionArray);
-	pfree(writeState);
-}
-
 /*
  * CreateEmptyStripeData allocates an empty StripeData structure with the given
  * column count. This structure has enough capacity to hold stripeMaxRowCount rows.
@@ -375,7 +217,6 @@ CreateEmptyStripeData(uint32 stripeMaxRowCount, uint32 blockRowCount,
 	return stripeData;
 }
 
-
 /*
  * CreateEmptyStripeSkipList allocates an empty StripeSkipList structure with
  * the given column count. This structure has enough blocks to hold statistics
@@ -405,6 +246,236 @@ CreateEmptyStripeSkipList(uint32 stripeMaxRowCount, uint32 blockRowCount,
 	return stripeSkipList;
 }
 
+/*
+ * SerializeBoolArray serializes the given boolean array and returns the result
+ * as a StringInfo. This function packs every 8 boolean values into one byte.
+ */
+static StringInfo
+SerializeBoolArray(bool *boolArray, uint32 boolArrayLength)
+{
+	StringInfo boolArrayBuffer = NULL;
+	uint32 boolArrayIndex = 0;
+	uint32 byteCount = (boolArrayLength + 7) / 8;
+
+	boolArrayBuffer = makeStringInfo();
+	enlargeStringInfo(boolArrayBuffer, byteCount);
+	boolArrayBuffer->len = byteCount;
+	memset(boolArrayBuffer->data, 0, byteCount);
+
+	for (boolArrayIndex = 0; boolArrayIndex < boolArrayLength; boolArrayIndex++)
+	{
+		if (boolArray[boolArrayIndex])
+		{
+			uint32 byteIndex = boolArrayIndex / 8;
+			uint32 bitIndex = boolArrayIndex % 8;
+			boolArrayBuffer->data[byteIndex] |= (1 << bitIndex);
+		}
+	}
+
+	return boolArrayBuffer;
+}
+
+
+/*
+ * SerializeDatumArray serializes the non-null elements of the given datum array
+ * into a string info buffer, and then returns this buffer.
+ */
+static StringInfo
+SerializeDatumArray(Datum *datumArray, bool *existsArray, uint32 datumCount,
+					bool datumTypeByValue, int datumTypeLength, char datumTypeAlign)
+{
+	StringInfo datumBuffer = makeStringInfo();
+	uint32 datumIndex = 0;
+
+	for (datumIndex = 0; datumIndex < datumCount; datumIndex++)
+	{
+		Datum datum = datumArray[datumIndex];
+		uint32 datumLength = 0;
+		uint32 datumLengthAligned = 0;
+		char *currentDatumDataPointer = NULL;
+
+		if (!existsArray[datumIndex])
+		{
+			continue;
+		}
+
+		datumLength = att_addlength_datum(0, datumTypeLength, datum);
+		datumLengthAligned = att_align_nominal(datumLength, datumTypeAlign);
+
+		enlargeStringInfo(datumBuffer, datumBuffer->len + datumLengthAligned);
+		currentDatumDataPointer = datumBuffer->data + datumBuffer->len;
+		memset(currentDatumDataPointer, 0, datumLengthAligned);
+
+		if (datumTypeLength > 0)
+		{
+			if (datumTypeByValue)
+			{
+				store_att_byval(currentDatumDataPointer, datum, datumTypeLength);
+			}
+			else
+			{
+				memcpy(currentDatumDataPointer, DatumGetPointer(datum),
+					   datumTypeLength);
+			}
+		}
+		else
+		{
+			Assert(!datumTypeByValue);
+			memcpy(currentDatumDataPointer, DatumGetPointer(datum), datumLength);
+		}
+
+		datumBuffer->len += datumLengthAligned;
+	}
+
+	return datumBuffer;
+}
+
+
+/*
+ * CreateExistsBufferArray serializes  the "exists" arrays of stripe data for
+ * each columnIndex and blockIndex combination and returns the result as a two
+ * dimensional array.
+ */
+static StringInfo **
+CreateExistsBufferArray(ColumnData **columnDataArray,
+						StripeSkipList *stripeSkipList)
+{
+	StringInfo **existsBufferArray = NULL;
+	uint32 columnIndex = 0;
+	uint32 columnCount = stripeSkipList->columnCount;
+	uint32 blockCount = stripeSkipList->blockCount;
+	ColumnBlockSkipNode **blockSkipNodeArray = stripeSkipList->blockSkipNodeArray;
+
+	existsBufferArray = palloc0(columnCount * sizeof(StringInfo *));
+	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
+	{
+		uint32 blockIndex = 0;
+
+		existsBufferArray[columnIndex] = palloc0(blockCount * sizeof(StringInfo));
+		for (blockIndex = 0; blockIndex < blockCount; blockIndex++)
+		{
+			ColumnData *columnData = columnDataArray[columnIndex];
+			ColumnBlockData *blockData = columnData->blockDataArray[blockIndex];
+			ColumnBlockSkipNode *blockSkipNode =
+				&blockSkipNodeArray[columnIndex][blockIndex];
+
+			StringInfo existsBuffer = SerializeBoolArray(blockData->existsArray,
+														 blockSkipNode->rowCount);
+
+			existsBufferArray[columnIndex][blockIndex] = existsBuffer;
+		}
+	}
+
+	return existsBufferArray;
+}
+
+/*
+ * CreateValueBufferArray serializes the "values" arrays of stripe data for
+ * each columnIndex and blockIndex combination and returns the result as a
+ * two dimensional array.
+ */
+static StringInfo **
+CreateValueBufferArray(ColumnData **columnDataArray,
+					   StripeSkipList *stripeSkipList,
+					   TupleDesc tupleDescriptor)
+{
+	StringInfo **valueBufferArray = NULL;
+	uint32 columnIndex = 0;
+	uint32 columnCount = stripeSkipList->columnCount;
+	uint32 blockCount = stripeSkipList->blockCount;
+	ColumnBlockSkipNode **blockSkipNodeArray = stripeSkipList->blockSkipNodeArray;
+
+	valueBufferArray = palloc0(columnCount * sizeof(StringInfo *));
+	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
+	{
+		Form_pg_attribute attributeForm = tupleDescriptor->attrs[columnIndex];
+		uint32 blockIndex = 0;
+
+		valueBufferArray[columnIndex] = palloc0(blockCount * sizeof(StringInfo));
+		for (blockIndex = 0; blockIndex < blockCount; blockIndex++)
+		{
+			ColumnData *columnData = columnDataArray[columnIndex];
+			ColumnBlockData *blockData = columnData->blockDataArray[blockIndex];
+			ColumnBlockSkipNode *blockSkipNode =
+				&blockSkipNodeArray[columnIndex][blockIndex];
+
+			StringInfo valueBuffer = SerializeDatumArray(blockData->valueArray,
+														 blockData->existsArray,
+														 blockSkipNode->rowCount,
+														 attributeForm->attbyval,
+														 attributeForm->attlen,
+														 attributeForm->attalign);
+
+			valueBufferArray[columnIndex][blockIndex] = valueBuffer;
+		}
+	}
+
+	return valueBufferArray;
+}
+
+/*
+ * CreateSkipListBufferArray serializes the skip list for each column of the
+ * given stripe and returns the result as an array.
+ */
+static StringInfo *
+CreateSkipListBufferArray(StripeSkipList *stripeSkipList, TupleDesc tupleDescriptor)
+{
+	StringInfo *skipListBufferArray = NULL;
+	uint32 columnIndex = 0;
+	uint32 columnCount = stripeSkipList->columnCount;
+
+	skipListBufferArray = palloc0(columnCount * sizeof(StringInfo));
+	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
+	{
+		StringInfo skipListBuffer = NULL;
+		ColumnBlockSkipNode *blockSkipNodeArray =
+			stripeSkipList->blockSkipNodeArray[columnIndex];
+		Form_pg_attribute attributeForm = tupleDescriptor->attrs[columnIndex];
+
+		skipListBuffer = SerializeColumnSkipList(blockSkipNodeArray,
+												 stripeSkipList->blockCount,
+												 attributeForm->attbyval,
+												 attributeForm->attlen);
+
+		skipListBufferArray[columnIndex] = skipListBuffer;
+	}
+
+	return skipListBufferArray;
+}
+
+/* Creates and returns the footer for given stripe. */
+static StripeFooter *
+CreateStripeFooter(StripeSkipList *stripeSkipList, StringInfo *skipListBufferArray)
+{
+	StripeFooter *stripeFooter = NULL;
+	uint32 columnIndex = 0;
+	uint32 columnCount = stripeSkipList->columnCount;
+	uint64 *skipListSizeArray = palloc0(columnCount * sizeof(uint64));
+	uint64 *existsSizeArray = palloc0(columnCount * sizeof(uint64));
+	uint64 *valueSizeArray = palloc0(columnCount * sizeof(uint64));
+
+	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
+	{
+		ColumnBlockSkipNode *blockSkipNodeArray =
+			stripeSkipList->blockSkipNodeArray[columnIndex];
+		uint32 blockIndex = 0;
+
+		for (blockIndex = 0; blockIndex < stripeSkipList->blockCount; blockIndex++)
+		{
+			existsSizeArray[columnIndex] += blockSkipNodeArray[blockIndex].existsLength;
+			valueSizeArray[columnIndex] += blockSkipNodeArray[blockIndex].valueLength;
+		}
+		skipListSizeArray[columnIndex] = skipListBufferArray[columnIndex]->len;
+	}
+
+	stripeFooter = palloc0(sizeof(StripeFooter));
+	stripeFooter->columnCount = columnCount;
+	stripeFooter->skipListSizeArray = skipListSizeArray;
+	stripeFooter->existsSizeArray = existsSizeArray;
+	stripeFooter->valueSizeArray = valueSizeArray;
+
+	return stripeFooter;
+}
 
 /*
  * FlushStripe compresses the data in the current stripe, flushes the compressed
@@ -666,241 +737,27 @@ FlushStripe(TableWriteState *writeState)
 	return stripeMetadata;
 }
 
-
-/*
- * CreateExistsBufferArray serializes  the "exists" arrays of stripe data for
- * each columnIndex and blockIndex combination and returns the result as a two
- * dimensional array.
- */
-static StringInfo **
-CreateExistsBufferArray(ColumnData **columnDataArray,
-						StripeSkipList *stripeSkipList)
+/* Creates a copy of the given datum. */
+static Datum
+DatumCopy(Datum datum, bool datumTypeByValue, int datumTypeLength)
 {
-	StringInfo **existsBufferArray = NULL;
-	uint32 columnIndex = 0;
-	uint32 columnCount = stripeSkipList->columnCount;
-	uint32 blockCount = stripeSkipList->blockCount;
-	ColumnBlockSkipNode **blockSkipNodeArray = stripeSkipList->blockSkipNodeArray;
+	Datum datumCopy = 0;
 
-	existsBufferArray = palloc0(columnCount * sizeof(StringInfo *));
-	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
+	if (datumTypeByValue)
 	{
-		uint32 blockIndex = 0;
+		datumCopy = datum;
+	}
+	else
+	{
+		uint32 datumLength = att_addlength_datum(0, datumTypeLength, datum);
+		char *datumData = palloc0(datumLength);
+		memcpy(datumData, DatumGetPointer(datum), datumLength);
 
-		existsBufferArray[columnIndex] = palloc0(blockCount * sizeof(StringInfo));
-		for (blockIndex = 0; blockIndex < blockCount; blockIndex++)
-		{
-			ColumnData *columnData = columnDataArray[columnIndex];
-			ColumnBlockData *blockData = columnData->blockDataArray[blockIndex];
-			ColumnBlockSkipNode *blockSkipNode =
-				&blockSkipNodeArray[columnIndex][blockIndex];
-
-			StringInfo existsBuffer = SerializeBoolArray(blockData->existsArray,
-														 blockSkipNode->rowCount);
-
-			existsBufferArray[columnIndex][blockIndex] = existsBuffer;
-		}
+		datumCopy = PointerGetDatum(datumData);
 	}
 
-	return existsBufferArray;
+	return datumCopy;
 }
-
-
-/*
- * CreateValueBufferArray serializes the "values" arrays of stripe data for
- * each columnIndex and blockIndex combination and returns the result as a
- * two dimensional array.
- */
-static StringInfo **
-CreateValueBufferArray(ColumnData **columnDataArray,
-					   StripeSkipList *stripeSkipList,
-					   TupleDesc tupleDescriptor)
-{
-	StringInfo **valueBufferArray = NULL;
-	uint32 columnIndex = 0;
-	uint32 columnCount = stripeSkipList->columnCount;
-	uint32 blockCount = stripeSkipList->blockCount;
-	ColumnBlockSkipNode **blockSkipNodeArray = stripeSkipList->blockSkipNodeArray;
-
-	valueBufferArray = palloc0(columnCount * sizeof(StringInfo *));
-	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
-	{
-		Form_pg_attribute attributeForm = tupleDescriptor->attrs[columnIndex];
-		uint32 blockIndex = 0;
-
-		valueBufferArray[columnIndex] = palloc0(blockCount * sizeof(StringInfo));
-		for (blockIndex = 0; blockIndex < blockCount; blockIndex++)
-		{
-			ColumnData *columnData = columnDataArray[columnIndex];
-			ColumnBlockData *blockData = columnData->blockDataArray[blockIndex];
-			ColumnBlockSkipNode *blockSkipNode =
-				&blockSkipNodeArray[columnIndex][blockIndex];
-
-			StringInfo valueBuffer = SerializeDatumArray(blockData->valueArray,
-														 blockData->existsArray,
-														 blockSkipNode->rowCount,
-														 attributeForm->attbyval,
-														 attributeForm->attlen,
-														 attributeForm->attalign);
-
-			valueBufferArray[columnIndex][blockIndex] = valueBuffer;
-		}
-	}
-
-	return valueBufferArray;
-}
-
-
-/*
- * CreateSkipListBufferArray serializes the skip list for each column of the
- * given stripe and returns the result as an array.
- */
-static StringInfo *
-CreateSkipListBufferArray(StripeSkipList *stripeSkipList, TupleDesc tupleDescriptor)
-{
-	StringInfo *skipListBufferArray = NULL;
-	uint32 columnIndex = 0;
-	uint32 columnCount = stripeSkipList->columnCount;
-
-	skipListBufferArray = palloc0(columnCount * sizeof(StringInfo));
-	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
-	{
-		StringInfo skipListBuffer = NULL;
-		ColumnBlockSkipNode *blockSkipNodeArray =
-			stripeSkipList->blockSkipNodeArray[columnIndex];
-		Form_pg_attribute attributeForm = tupleDescriptor->attrs[columnIndex];
-
-		skipListBuffer = SerializeColumnSkipList(blockSkipNodeArray,
-												 stripeSkipList->blockCount,
-												 attributeForm->attbyval,
-												 attributeForm->attlen);
-
-		skipListBufferArray[columnIndex] = skipListBuffer;
-	}
-
-	return skipListBufferArray;
-}
-
-
-/* Creates and returns the footer for given stripe. */
-static StripeFooter *
-CreateStripeFooter(StripeSkipList *stripeSkipList, StringInfo *skipListBufferArray)
-{
-	StripeFooter *stripeFooter = NULL;
-	uint32 columnIndex = 0;
-	uint32 columnCount = stripeSkipList->columnCount;
-	uint64 *skipListSizeArray = palloc0(columnCount * sizeof(uint64));
-	uint64 *existsSizeArray = palloc0(columnCount * sizeof(uint64));
-	uint64 *valueSizeArray = palloc0(columnCount * sizeof(uint64));
-
-	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
-	{
-		ColumnBlockSkipNode *blockSkipNodeArray =
-			stripeSkipList->blockSkipNodeArray[columnIndex];
-		uint32 blockIndex = 0;
-
-		for (blockIndex = 0; blockIndex < stripeSkipList->blockCount; blockIndex++)
-		{
-			existsSizeArray[columnIndex] += blockSkipNodeArray[blockIndex].existsLength;
-			valueSizeArray[columnIndex] += blockSkipNodeArray[blockIndex].valueLength;
-		}
-		skipListSizeArray[columnIndex] = skipListBufferArray[columnIndex]->len;
-	}
-
-	stripeFooter = palloc0(sizeof(StripeFooter));
-	stripeFooter->columnCount = columnCount;
-	stripeFooter->skipListSizeArray = skipListSizeArray;
-	stripeFooter->existsSizeArray = existsSizeArray;
-	stripeFooter->valueSizeArray = valueSizeArray;
-
-	return stripeFooter;
-}
-
-
-/*
- * SerializeBoolArray serializes the given boolean array and returns the result
- * as a StringInfo. This function packs every 8 boolean values into one byte.
- */
-static StringInfo
-SerializeBoolArray(bool *boolArray, uint32 boolArrayLength)
-{
-	StringInfo boolArrayBuffer = NULL;
-	uint32 boolArrayIndex = 0;
-	uint32 byteCount = (boolArrayLength + 7) / 8;
-
-	boolArrayBuffer = makeStringInfo();
-	enlargeStringInfo(boolArrayBuffer, byteCount);
-	boolArrayBuffer->len = byteCount;
-	memset(boolArrayBuffer->data, 0, byteCount);
-
-	for (boolArrayIndex = 0; boolArrayIndex < boolArrayLength; boolArrayIndex++)
-	{
-		if (boolArray[boolArrayIndex])
-		{
-			uint32 byteIndex = boolArrayIndex / 8;
-			uint32 bitIndex = boolArrayIndex % 8;
-			boolArrayBuffer->data[byteIndex] |= (1 << bitIndex);
-		}
-	}
-
-	return boolArrayBuffer;
-}
-
-
-/*
- * SerializeDatumArray serializes the non-null elements of the given datum array
- * into a string info buffer, and then returns this buffer.
- */
-static StringInfo
-SerializeDatumArray(Datum *datumArray, bool *existsArray, uint32 datumCount,
-					bool datumTypeByValue, int datumTypeLength, char datumTypeAlign)
-{
-	StringInfo datumBuffer = makeStringInfo();
-	uint32 datumIndex = 0;
-
-	for (datumIndex = 0; datumIndex < datumCount; datumIndex++)
-	{
-		Datum datum = datumArray[datumIndex];
-		uint32 datumLength = 0;
-		uint32 datumLengthAligned = 0;
-		char *currentDatumDataPointer = NULL;
-
-		if (!existsArray[datumIndex])
-		{
-			continue;
-		}
-
-		datumLength = att_addlength_datum(0, datumTypeLength, datum);
-		datumLengthAligned = att_align_nominal(datumLength, datumTypeAlign);
-
-		enlargeStringInfo(datumBuffer, datumBuffer->len + datumLengthAligned);
-		currentDatumDataPointer = datumBuffer->data + datumBuffer->len;
-		memset(currentDatumDataPointer, 0, datumLengthAligned);
-
-		if (datumTypeLength > 0)
-		{
-			if (datumTypeByValue)
-			{
-				store_att_byval(currentDatumDataPointer, datum, datumTypeLength);
-			}
-			else
-			{
-				memcpy(currentDatumDataPointer, DatumGetPointer(datum),
-					   datumTypeLength);
-			}
-		}
-		else
-		{
-			Assert(!datumTypeByValue);
-			memcpy(currentDatumDataPointer, DatumGetPointer(datum), datumLength);
-		}
-
-		datumBuffer->len += datumLengthAligned;
-	}
-
-	return datumBuffer;
-}
-
 
 /*
  * UpdateBlockSkipNodeMinMax takes the given column value, and checks if this
@@ -965,30 +822,6 @@ UpdateBlockSkipNodeMinMax(ColumnBlockSkipNode *blockSkipNode, Datum columnValue,
 	blockSkipNode->maximumValue = currentMaximum;
 }
 
-
-/* Creates a copy of the given datum. */
-static Datum
-DatumCopy(Datum datum, bool datumTypeByValue, int datumTypeLength)
-{
-	Datum datumCopy = 0;
-
-	if (datumTypeByValue)
-	{
-		datumCopy = datum;
-	}
-	else
-	{
-		uint32 datumLength = att_addlength_datum(0, datumTypeLength, datum);
-		char *datumData = palloc0(datumLength);
-		memcpy(datumData, DatumGetPointer(datum), datumLength);
-
-		datumCopy = PointerGetDatum(datumData);
-	}
-
-	return datumCopy;
-}
-
-
 /*
  * AppendStripeMetadata adds a copy of given stripeMetadata to the given
  * table footer's stripeMetadataList.
@@ -1001,4 +834,133 @@ AppendStripeMetadata(TableFooter *tableFooter, StripeMetadata stripeMetadata)
 
 	tableFooter->stripeMetadataList = lappend(tableFooter->stripeMetadataList,
 											  stripeMetadataCopy);
+}
+
+/*
+ * CStoreWriteRow adds a row to the cstore file. If the stripe is not initialized,
+ * we create structures to hold stripe data and skip list. Then, we add data for
+ * each of the columns and update corresponding skip nodes. Then, if row count
+ * exceeds stripeMaxRowCount, we flush the stripe, and add its metadata to the
+ * table footer.
+ */
+void
+CStoreWriteRow(TableWriteState *writeState, Datum *columnValues, bool *columnNulls)
+{
+	uint32 columnIndex = 0;
+	uint32 blockIndex = 0;
+	uint32 blockRowIndex = 0;
+	StripeData *stripeData = writeState->stripeData;
+	StripeSkipList *stripeSkipList = writeState->stripeSkipList;
+	uint32 columnCount = writeState->tupleDescriptor->natts;
+	TableFooter *tableFooter = writeState->tableFooter;
+	const uint32 blockRowCount = tableFooter->blockRowCount;
+
+	MemoryContext oldContext = MemoryContextSwitchTo(writeState->stripeWriteContext);
+
+	if (stripeData == NULL)
+	{
+		stripeData = CreateEmptyStripeData(writeState->stripeMaxRowCount,
+										   blockRowCount, columnCount);
+		stripeSkipList = CreateEmptyStripeSkipList(writeState->stripeMaxRowCount,
+												   blockRowCount, columnCount);
+		writeState->stripeData = stripeData;
+		writeState->stripeSkipList = stripeSkipList;
+	}
+
+	blockIndex = stripeData->rowCount / blockRowCount;
+	blockRowIndex = stripeData->rowCount % blockRowCount;
+
+	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
+	{
+		ColumnData *columnData = stripeData->columnDataArray[columnIndex];
+		ColumnBlockData *blockData = columnData->blockDataArray[blockIndex];
+		ColumnBlockSkipNode **blockSkipNodeArray = stripeSkipList->blockSkipNodeArray;
+		ColumnBlockSkipNode *blockSkipNode =
+			&blockSkipNodeArray[columnIndex][blockIndex];
+
+		if (columnNulls[columnIndex])
+		{
+			blockData->existsArray[blockRowIndex] = false;
+		}
+		else
+		{
+			FmgrInfo *comparisonFunction =
+				writeState->comparisonFunctionArray[columnIndex];
+			Form_pg_attribute attributeForm =
+				writeState->tupleDescriptor->attrs[columnIndex];
+			bool columnTypeByValue = attributeForm->attbyval;
+			int columnTypeLength = attributeForm->attlen;
+			Oid columnCollation = attributeForm->attcollation;
+
+			blockData->existsArray[blockRowIndex] = true;
+			blockData->valueArray[blockRowIndex] = DatumCopy(columnValues[columnIndex],
+															 columnTypeByValue,
+															 columnTypeLength);
+
+			UpdateBlockSkipNodeMinMax(blockSkipNode, columnValues[columnIndex],
+									  columnTypeByValue, columnTypeLength,
+									  columnCollation, comparisonFunction);
+		}
+
+		blockSkipNode->rowCount++;
+	}
+
+	stripeSkipList->blockCount = blockIndex + 1;
+	stripeData->rowCount++;
+	if (stripeData->rowCount >= writeState->stripeMaxRowCount)
+	{
+		StripeMetadata stripeMetadata = FlushStripe(writeState);
+		MemoryContextReset(writeState->stripeWriteContext);
+
+		/* set stripe data and skip list to NULL so they are recreated next time */
+		writeState->stripeData = NULL;
+		writeState->stripeSkipList = NULL;
+
+		/*
+		 * Append stripeMetadata in old context so next MemoryContextReset
+		 * doesn't free it.
+		 */
+		MemoryContextSwitchTo(oldContext);
+		AppendStripeMetadata(tableFooter, stripeMetadata);
+	}
+	else
+	{
+		MemoryContextSwitchTo(oldContext);
+	}
+}
+
+
+/*
+ * CStoreEndWrite finishes a cstore data load operation. If we have an unflushed
+ * stripe, we flush it. Then, we sync and close the cstore data file. Last, we
+ * flush the footer to a temporary file, and atomically rename this temporary
+ * file to the original footer file.
+ */
+void
+CStoreEndWrite(rados_ioctx_t *ioctx, TableWriteState *writeState)
+{
+	StringInfo tableFooterFilename = NULL;
+
+	StripeData *stripeData = writeState->stripeData;
+	if (stripeData != NULL)
+	{
+		MemoryContext oldContext = MemoryContextSwitchTo(writeState->stripeWriteContext);
+
+		StripeMetadata stripeMetadata = FlushStripe(writeState);
+		MemoryContextReset(writeState->stripeWriteContext);
+
+		MemoryContextSwitchTo(oldContext);
+		AppendStripeMetadata(writeState->tableFooter, stripeMetadata);
+	}
+
+	tableFooterFilename = writeState->tableFooterFilename;
+	CStoreWriteFooter(ioctx, tableFooterFilename, writeState->tableFooter);
+
+	MemoryContextDelete(writeState->stripeWriteContext);
+	list_free_deep(writeState->tableFooter->stripeMetadataList);
+	pfree(writeState->tableFooter);
+	pfree(writeState->tableFooterFilename->data);
+	pfree(writeState->tableFooterFilename);
+	pfree(writeState->comparisonFunctionArray);
+	pfree(writeState);
 }
