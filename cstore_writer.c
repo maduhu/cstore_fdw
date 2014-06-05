@@ -141,25 +141,10 @@ CStoreBeginWrite(const char *objprefix, rados_ioctx_t *ioctx,
 
 	ret = rados_stat(*ioctx, tableFooterFilename->data, NULL, NULL);
 	if (ret) {
-#if 0
-		ret = rados_write_full(*ioctx, objprefix, NULL, 0);
-		if (ret) {
-			ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
-				errmsg("could not create table file: ret=%d", ret)));
-		}
-#endif
-
 		tableFooter = palloc0(sizeof(TableFooter));
 		tableFooter->blockRowCount = blockRowCount;
 		tableFooter->stripeMetadataList = NIL;
 	} else {
-#if 0
-		ret = rados_stat(*ioctx, objprefix, NULL, NULL);
-		if (ret) {
-			ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
-				errmsg("table file not found: ret=%d", ret)));
-		}
-#endif
 		tableFooter = CStoreReadFooter(ioctx, tableFooterFilename);
 	}
 
