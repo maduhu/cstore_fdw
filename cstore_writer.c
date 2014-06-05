@@ -440,6 +440,8 @@ FlushStripe(TableWriteState *writeState)
 	uint64 fileoffset = writeState->currentFileOffset;
 	uint64 objoffset = 0;
 	StringInfo objname = NULL;
+	StringInfo *columnObjNames;
+	uint64 *columnObjOffsets;
 	int ret;
 
 	/*
@@ -449,6 +451,24 @@ FlushStripe(TableWriteState *writeState)
 	 */
 	objname = makeStringInfo();
 	appendStringInfo(objname, "%s.%llu", tableFilename->data, (long long)fileoffset);
+
+	/*
+	 * Names of the per-column object for this stripe
+	 */
+	columnObjNames = palloc0(columnCount * sizeof(StringInfo));
+	for (columnIndex = 0; columnIndex < columnCount; columnIndex++) {
+		columnObjNames[columnIndex] = makeStringInfo();
+		appendStringInfo(columnObjNames[columnIndex], "%s.off-%llu.col-%u",
+			tableFilename->data, (long long)fileoffset, columnIndex);
+	}
+
+	/*
+	 * Offset in each column object where we are currently writing
+	 */
+	columnObjOffsets = palloc0(columnCount * sizeof(uint64));
+	for (columnIndex = 0; columnIndex < columnCount; columnIndex++) {
+		columnObjOffsets[columnIndex] = 0;
+	}
 
 	ret = rados_trunc(*ioctx, objname->data, 0);
 	if (ret) {
@@ -563,6 +583,15 @@ FlushStripe(TableWriteState *writeState)
 		WriteToObject(ioctx, objname->data, skipListBuffer->data,
 				skipListBuffer->len, objoffset);
 		objoffset += skipListBuffer->len;
+
+		/*
+		 * FIXME: Write the skip list for this column/stripe into the
+		 * per-column/stripe object.
+		 */
+		WriteToObject(ioctx, columnObjNames[columnIndex]->data,
+				skipListBuffer->data, skipListBuffer->len,
+				columnObjOffsets[columnIndex]);
+		columnObjOffsets[columnIndex] += skipListBuffer->len;
 	}
 
 	/* then, we flush the data buffers */
@@ -575,6 +604,14 @@ FlushStripe(TableWriteState *writeState)
 			WriteToObject(ioctx, objname->data, existsBuffer->data,
 					existsBuffer->len, objoffset);
 			objoffset += existsBuffer->len;
+
+			/*
+			 * FIXME
+			 */
+			WriteToObject(ioctx, columnObjNames[columnIndex]->data,
+					existsBuffer->data, existsBuffer->len,
+					columnObjOffsets[columnIndex]);
+			columnObjOffsets[columnIndex] += existsBuffer->len;
 		}
 
 		for (blockIndex = 0; blockIndex < stripeSkipList->blockCount; blockIndex++)
@@ -583,6 +620,14 @@ FlushStripe(TableWriteState *writeState)
 			WriteToObject(ioctx, objname->data, valueBuffer->data,
 					valueBuffer->len, objoffset);
 			objoffset += valueBuffer->len;
+
+			/*
+			 * FIXME
+			 */
+			WriteToObject(ioctx, columnObjNames[columnIndex]->data,
+					valueBuffer->data, valueBuffer->len,
+					columnObjOffsets[columnIndex]);
+			columnObjOffsets[columnIndex] += valueBuffer->len;
 		}
 	}
 
@@ -590,6 +635,14 @@ FlushStripe(TableWriteState *writeState)
 	WriteToObject(ioctx, objname->data, stripeFooterBuffer->data,
 			stripeFooterBuffer->len, objoffset);
 	objoffset += stripeFooterBuffer->len;
+
+	/*
+	 * FIXME: here we are putting the footer on column 0. Need to fix this
+	 * later with a different storage layout.
+	 */
+	WriteToObject(ioctx, columnObjNames[0]->data, stripeFooterBuffer->data,
+			stripeFooterBuffer->len, columnObjOffsets[0]);
+	columnObjOffsets[0] += stripeFooterBuffer->len;
 
 
 	/* set stripe metadata */
