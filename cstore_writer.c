@@ -513,8 +513,10 @@ FlushStripe(TableWriteState *writeState)
 	StringInfo objname = NULL;
 	StringInfo *columnObjNames;
 	StringInfo stripeFooterObjName;
+	StringInfo stripeSkiplistObjName;
+	uint64 stripeSkiplistObjOffset;
 	uint64 *columnObjOffsets;
-	int ret;
+	//int ret;
 
 	/*
 	 * A stripe is uniquely identified by its starting offset in the file.
@@ -541,12 +543,12 @@ FlushStripe(TableWriteState *writeState)
 	for (columnIndex = 0; columnIndex < columnCount; columnIndex++) {
 		columnObjOffsets[columnIndex] = 0;
 	}
-
+#if 0
 	ret = rados_trunc(*ioctx, objname->data, 0);
 	if (ret) {
 		ereport(ERROR, (errmsg("failed to truncate stripe obj: ret=%d", ret)));
 	}
-
+#endif
 	/* create "exists" and "value" buffers */
 	existsBufferArray = CreateExistsBufferArray(stripeData->columnDataArray,
 												stripeSkipList);
@@ -649,21 +651,35 @@ FlushStripe(TableWriteState *writeState)
 	 *
 	 * We start by flushing the skip list buffers.
 	 */
+
+	/*
+	 * FIXME: obj name for the skiplist object for this stripe
+	 */
+	stripeSkiplistObjName = makeStringInfo();
+	appendStringInfo(stripeSkiplistObjName, "%s.off-%llu.skiplist",
+			tableFilename->data, (long long)fileoffset);
+	stripeSkiplistObjOffset = 0;
+
 	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
 	{
 		StringInfo skipListBuffer = skipListBufferArray[columnIndex];
+		/*
+		 * FIXME: remove later. we maintain the correct offsets, but
+		 * we make a hole and put the skiplist in a dedicated obj.
+		 */
+#if 0
 		WriteToObject(ioctx, objname->data, skipListBuffer->data,
 				skipListBuffer->len, objoffset);
+#endif
 		objoffset += skipListBuffer->len;
 
 		/*
-		 * FIXME: Write the skip list for this column/stripe into the
-		 * per-column/stripe object.
+		 * FIXME: here we write the skiplist data into a dedicated obj
+		 * for the stripe skiplist.
 		 */
-		WriteToObject(ioctx, columnObjNames[columnIndex]->data,
-				skipListBuffer->data, skipListBuffer->len,
-				columnObjOffsets[columnIndex]);
-		columnObjOffsets[columnIndex] += skipListBuffer->len;
+		WriteToObject(ioctx, stripeSkiplistObjName->data, skipListBuffer->data,
+				skipListBuffer->len, stripeSkiplistObjOffset);
+		stripeSkiplistObjOffset += skipListBuffer->len;
 	}
 
 	/* then, we flush the data buffers */
@@ -673,8 +689,10 @@ FlushStripe(TableWriteState *writeState)
 		for (blockIndex = 0; blockIndex < stripeSkipList->blockCount; blockIndex++)
 		{
 			StringInfo existsBuffer = existsBufferArray[columnIndex][blockIndex];
+#if 0
 			WriteToObject(ioctx, objname->data, existsBuffer->data,
 					existsBuffer->len, objoffset);
+#endif
 			objoffset += existsBuffer->len;
 
 			/*
@@ -689,8 +707,10 @@ FlushStripe(TableWriteState *writeState)
 		for (blockIndex = 0; blockIndex < stripeSkipList->blockCount; blockIndex++)
 		{
 			StringInfo valueBuffer = valueBufferArray[columnIndex][blockIndex];
+#if 0
 			WriteToObject(ioctx, objname->data, valueBuffer->data,
 					valueBuffer->len, objoffset);
+#endif
 			objoffset += valueBuffer->len;
 
 			/*

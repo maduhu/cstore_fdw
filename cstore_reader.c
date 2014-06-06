@@ -307,6 +307,10 @@ LoadColumnData(TableReadState *readState, StringInfo objname, ColumnBlockSkipNod
 	{
 		ColumnBlockSkipNode *blockSkipNode = &blockSkipNodeArray[blockIndex];
 		uint32 rowCount = blockSkipNode->rowCount;
+		/*
+		 * The block offset is wrong because it is calculated assuming
+		 * all the columns are serialized together.????
+		 */
 		uint64 existsOffset = existsFileOffset + blockSkipNode->existsBlockOffset;
 		//StringInfo rawExistsBuffer = ReadFromObject(ioctx, tableFilename->data,
 		//		existsOffset, blockSkipNode->existsLength);
@@ -395,7 +399,8 @@ LoadStripeSkipList(TableReadState *readState, StripeMetadata *stripeMetadata,
 	StringInfo objname;
 
 	objname = makeStringInfo();
-	appendStringInfo(objname, "%s.%llu", tableFilename->data, (long long)stripeMetadata->fileOffset);
+	appendStringInfo(objname, "%s.off-%llu.skiplist", tableFilename->data,
+			(long long)stripeMetadata->fileOffset);
 
 	/* deserialize block count */
 	firstColumnSkipListBuffer = ReadFromObject(ioctx, objname->data,
@@ -751,20 +756,26 @@ LoadFilteredStripeData(TableReadState *readState, StripeMetadata *stripeMetadata
 
 	StripeSkipList *selectedBlockSkipList = SelectedBlockSkipList(stripeSkipList,
 																  selectedBlockMask);
+#if 0
 	objname = makeStringInfo();
 	appendStringInfo(objname, "%s.%llu", readState->tableFilename->data, (long long)stripeMetadata->fileOffset);
+#endif
 
 	/* load column data for projected columns */
 	columnDataArray = palloc0(columnCount * sizeof(ColumnData *));
 	//currentColumnFileOffset = stripeMetadata->fileOffset + stripeMetadata->skipListLength;
-	currentColumnFileOffset = stripeMetadata->skipListLength;
+	//currentColumnFileOffset = stripeMetadata->skipListLength;
 
 	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
 	{
 		uint64 existsSize = stripeFooter->existsSizeArray[columnIndex];
 		uint64 valueSize = stripeFooter->valueSizeArray[columnIndex];
-		uint64 existsFileOffset = currentColumnFileOffset;
-		uint64 valueFileOffset = currentColumnFileOffset + existsSize;
+		uint64 existsFileOffset = 0;//currentColumnFileOffset;
+		uint64 valueFileOffset = existsSize; //currentColumnFileOffset + existsSize;
+
+		objname = makeStringInfo();
+		appendStringInfo(objname, "%s.off-%llu.col-%u", readState->tableFilename->data,
+				(long long)stripeMetadata->fileOffset, columnIndex);
 
 		if (projectedColumnMask[columnIndex])
 		{
