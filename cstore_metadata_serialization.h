@@ -31,9 +31,9 @@ extern StringInfo SerializeColumnSkipList(ColumnBlockSkipNode *blockSkipNodeArra
 /* Function declarations for metadata deserialization */
 extern void DeserializePostScript(StringInfo buffer, uint64 *tableFooterLength);
 extern TableFooter * DeserializeTableFooter(StringInfo buffer);
-extern uint32 DeserializeBlockCount(StringInfo buffer);
+extern uint32 DeserializeBlockCount(StringInfo buffer, uint64 len);
 extern StripeFooter * DeserializeStripeFooter(StringInfo buffer);
-extern ColumnBlockSkipNode * DeserializeColumnSkipList(StringInfo buffer,
+extern ColumnBlockSkipNode * DeserializeColumnSkipList(StringInfo buffer, size_t offset, uint64 len,
 													   bool typeByValue, int typeLength,
 													   uint32 blockCount);
 

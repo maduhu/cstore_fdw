@@ -116,26 +116,18 @@ typedef struct CStoreFdwOptions
 
 
 /*
- * StripeMetadata represents information about a stripe. This information is
- * stored in the cstore file's footer.
+ * StripeFooter represents a stripe's footer. In this footer, we keep three
+ * arrays of sizes. The number of elements in each of the arrays is equal
+ * to the number of columns.
  */
-typedef struct StripeMetadata
+typedef struct StripeFooter
 {
-	uint64 fileOffset;
-	uint64 skipListLength;
-	uint64 dataLength;
-	uint64 footerLength;
+	uint32 columnCount;
+	uint64 *skipListSizeArray;
+	uint64 *existsSizeArray;
+	uint64 *valueSizeArray;
 
-} StripeMetadata;
-
-
-/* TableFooter represents the footer of a cstore file. */
-typedef struct TableFooter
-{
-	List *stripeMetadataList;
-	uint64 blockRowCount;
-
-} TableFooter;
+} StripeFooter;
 
 
 /* ColumnBlockSkipNode contains statistics for a ColumnBlockData. */
@@ -176,6 +168,38 @@ typedef struct StripeSkipList
 } StripeSkipList;
 
 
+
+/*
+ * StripeMetadata represents information about a stripe. This information is
+ * stored in the cstore file's footer.
+ */
+typedef struct StripeMetadata
+{
+	uint64 fileOffset;
+	uint64 skipListLength;
+	uint64 dataLength;
+	uint64 footerLength;
+
+  rados_completion_t sl_completion;
+  rados_completion_t ft_completion;
+  StringInfo skipListBuffer;
+  StringInfo footerBuffer;
+
+  StripeFooter *stripeFooter;
+  StripeSkipList *stripeSkipList;
+
+} StripeMetadata;
+
+
+/* TableFooter represents the footer of a cstore file. */
+typedef struct TableFooter
+{
+	List *stripeMetadataList;
+	uint64 blockRowCount;
+
+} TableFooter;
+
+
 /*
  * ColumnBlockData represents a block of data in a column. valueArray stores
  * the values of data, and existsArray stores whether a value is present.
@@ -208,21 +232,6 @@ typedef struct StripeData
 	ColumnData **columnDataArray;
 
 } StripeData;
-
-
-/*
- * StripeFooter represents a stripe's footer. In this footer, we keep three
- * arrays of sizes. The number of elements in each of the arrays is equal
- * to the number of columns.
- */
-typedef struct StripeFooter
-{
-	uint32 columnCount;
-	uint64 *skipListSizeArray;
-	uint64 *existsSizeArray;
-	uint64 *valueSizeArray;
-
-} StripeFooter;
 
 
 /* TableReadState represents state of a cstore file read operation. */

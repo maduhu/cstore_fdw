@@ -386,13 +386,13 @@ DeserializeStripeFooter(StringInfo buffer)
  * returns the number of blocks in column skip list.
  */
 uint32
-DeserializeBlockCount(StringInfo buffer)
+DeserializeBlockCount(StringInfo buffer, uint64 len)
 {
 	uint32 blockCount = 0;
 	Protobuf__ColumnBlockSkipList *protobufBlockSkipList = NULL;
 
 	protobufBlockSkipList =
-		protobuf__column_block_skip_list__unpack(NULL, buffer->len,
+		protobuf__column_block_skip_list__unpack(NULL, len,
 												 (uint8 *) buffer->data);
 	if (protobufBlockSkipList == NULL)
 	{
@@ -414,7 +414,9 @@ DeserializeBlockCount(StringInfo buffer)
  * equal to the given block count function errors out.
  */
 ColumnBlockSkipNode *
-DeserializeColumnSkipList(StringInfo buffer, bool typeByValue, int typeLength,
+DeserializeColumnSkipList(StringInfo buffer,
+		size_t offset, uint64 len,
+		bool typeByValue, int typeLength,
 						  uint32 blockCount)
 {
 	ColumnBlockSkipNode *blockSkipNodeArray = NULL;
@@ -422,8 +424,7 @@ DeserializeColumnSkipList(StringInfo buffer, bool typeByValue, int typeLength,
 	Protobuf__ColumnBlockSkipList *protobufBlockSkipList = NULL;
 
 	protobufBlockSkipList =
-		protobuf__column_block_skip_list__unpack(NULL, buffer->len,
-												 (uint8 *) buffer->data);
+		protobuf__column_block_skip_list__unpack(NULL, len, ((uint8 *)buffer->data) + offset);
 	if (protobufBlockSkipList == NULL)
 	{
 		ereport(ERROR, (errmsg("could not unpack column store"),

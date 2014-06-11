@@ -48,10 +48,7 @@ static ColumnData * LoadColumnData(TableReadState *readState, StringInfo objname
 								   uint32 blockCount, uint64 existsFileOffset,
 								   uint64 valueFileOffset,
 								   Form_pg_attribute attributeForm);
-static StripeFooter * LoadStripeFooter(TableReadState *readState, StripeMetadata *stripeMetadata,
-									   uint32 columnCount);
-static StripeSkipList * LoadStripeSkipList(TableReadState *readState,
-										   StripeMetadata *stripeMetadata,
+static StripeSkipList * LoadStripeSkipList(StripeMetadata *stripeMetadata,
 										   StripeFooter *stripeFooter,
 										   uint32 columnCount,
 										   Form_pg_attribute *attributeFormArray);
@@ -138,6 +135,11 @@ CStoreReadFooter(rados_ioctx_t *ioctx, StringInfo tableFooterFilename)
 	return tableFooter;
 }
 
+static void read_stripe_complete(rados_completion_t cb, void *arg)                                                                                                                                                                                    
+{
+	StripeMetadata *stripeMetadata = (StripeMetadata*)arg;
+	// release?
+}
 
 /*
  * CStoreBeginRead initializes a cstore read operation. This function returns a
@@ -151,6 +153,7 @@ CStoreBeginRead(const char *filename, rados_t *rados, rados_ioctx_t *ioctx,
 	TableFooter *tableFooter = NULL;
 	StringInfo tableFilename = NULL;
 	MemoryContext stripeReadContext = NULL;
+	ListCell *stripeMetadataCell = NULL;
 
 	StringInfo tableFooterFilename = makeStringInfo();
 	appendStringInfo(tableFooterFilename, "%s%s", filename, CSTORE_FOOTER_FILE_SUFFIX);
@@ -162,6 +165,107 @@ CStoreBeginRead(const char *filename, rados_t *rados, rados_ioctx_t *ioctx,
 
 	pfree(tableFooterFilename->data);
 	pfree(tableFooterFilename);
+
+	/*
+	 * Read all stripe skiplists and footers.
+	 */
+	foreach(stripeMetadataCell, tableFooter->stripeMetadataList) {
+		StripeMetadata *stripeMetadata = lfirst(stripeMetadataCell);
+		StringInfo objname = makeStringInfo();
+		int ret;
+
+		// buffer for skiplist blob
+		stripeMetadata->skipListBuffer = makeStringInfo();
+		enlargeStringInfo(stripeMetadata->skipListBuffer, stripeMetadata->skipListLength);
+		stripeMetadata->skipListBuffer->len = stripeMetadata->skipListLength;
+
+		// buffer for footer blob
+		stripeMetadata->footerBuffer = makeStringInfo();
+		enlargeStringInfo(stripeMetadata->footerBuffer, stripeMetadata->footerLength);
+		stripeMetadata->footerBuffer->len = stripeMetadata->footerLength;
+
+		// name of object storing this stripe
+		appendStringInfo(objname, "%s.%llu", tableFilename->data,
+				(long long)stripeMetadata->fileOffset);
+
+		// setup skiplist read
+		ret = rados_aio_create_completion(stripeMetadata, read_stripe_complete,
+				read_stripe_complete, &stripeMetadata->sl_completion);
+		if (ret) {
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+				errmsg("could not create aio completion: ret=%d", ret)));
+		}
+
+		ret = rados_aio_read(*ioctx, objname->data, stripeMetadata->sl_completion,
+				stripeMetadata->skipListBuffer->data, stripeMetadata->skipListLength, 0);
+		if (ret) {
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+				errmsg("skip list aio read: ret=%d", ret)));
+		}
+
+		// setup footer read
+		ret = rados_aio_create_completion(stripeMetadata, read_stripe_complete,
+				read_stripe_complete, &stripeMetadata->ft_completion);
+		if (ret) {
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+				errmsg("could not create aio completion: ret=%d", ret)));
+		}
+
+		ret = rados_aio_read(*ioctx, objname->data, stripeMetadata->ft_completion,
+				stripeMetadata->footerBuffer->data, stripeMetadata->footerLength,
+				stripeMetadata->skipListLength + stripeMetadata->dataLength);
+		if (ret) {
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+				errmsg("skip list aio read: ret=%d", ret)));
+		}
+
+		pfree(objname->data);
+		pfree(objname);
+	}
+
+	/*
+	 * De
+	 */
+	foreach(stripeMetadataCell, tableFooter->stripeMetadataList) {
+		StripeMetadata *stripeMetadata = lfirst(stripeMetadataCell);
+		int ret;
+
+		ret = rados_aio_wait_for_complete(stripeMetadata->ft_completion);
+		if (ret) {
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+				errmsg("wait for footer complete: ret=%d", ret)));
+		}
+
+		ret = rados_aio_get_return_value(stripeMetadata->ft_completion);
+		if (ret <= 0) {
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+				errmsg("bad footer read: ret=%d", ret)));
+		}
+
+		ret = rados_aio_wait_for_complete(stripeMetadata->sl_completion);
+		if (ret) {
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+				errmsg("wait for complete: ret=%d", ret)));
+		}
+
+		ret = rados_aio_get_return_value(stripeMetadata->sl_completion);
+		if (ret <= 0) {
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+				errmsg("bad skip list read: ret=%d", ret)));
+		}
+
+		stripeMetadata->stripeFooter = DeserializeStripeFooter(stripeMetadata->footerBuffer);
+		if (stripeMetadata->stripeFooter->columnCount != tupleDescriptor->natts)
+		{
+			ereport(ERROR, (errmsg("stripe footer column count and table column count "
+							"don't match")));
+		}
+
+		stripeMetadata->stripeSkipList = LoadStripeSkipList(stripeMetadata,
+				stripeMetadata->stripeFooter,
+				tupleDescriptor->natts,
+				tupleDescriptor->attrs);
+	}
 
 	/*
 	 * We allocate all stripe specific data in the stripeReadContext, and reset
@@ -297,11 +401,8 @@ LoadFilteredStripeData(TableReadState *readState, StripeMetadata *stripeMetadata
 	uint32 columnCount = tupleDescriptor->natts;
 	StringInfo objname;
 
-	StripeFooter *stripeFooter = LoadStripeFooter(readState, stripeMetadata,
-												  columnCount);
-	StripeSkipList *stripeSkipList = LoadStripeSkipList(readState, stripeMetadata,
-														stripeFooter, columnCount,
-														attributeFormArray);
+	StripeFooter *stripeFooter = stripeMetadata->stripeFooter;
+	StripeSkipList *stripeSkipList = stripeMetadata->stripeSkipList;
 
 	bool *projectedColumnMask = ProjectedColumnMask(columnCount, projectedColumnList);
 	bool *selectedBlockMask = SelectedBlockMask(stripeSkipList, projectedColumnList,
@@ -452,78 +553,39 @@ LoadColumnData(TableReadState *readState, StringInfo objname, ColumnBlockSkipNod
 }
 
 
-/* Reads and returns the given stripe's footer. */
-static StripeFooter *
-LoadStripeFooter(TableReadState *readState, StripeMetadata *stripeMetadata,
-				 uint32 columnCount)
-{
-	StripeFooter *stripeFooter = NULL;
-	StringInfo footerBuffer = NULL;
-	uint64 footerOffset = 0;
-	rados_ioctx_t *ioctx = readState->ioctx;
-	StringInfo tableFilename = readState->tableFilename;
-	StringInfo objname;
-
-	objname = makeStringInfo();
-	appendStringInfo(objname, "%s.%llu", tableFilename->data, (long long)stripeMetadata->fileOffset);
-
-	footerOffset += stripeMetadata->skipListLength;
-	footerOffset += stripeMetadata->dataLength;
-
-	footerBuffer = ReadFromObject(ioctx, objname->data, footerOffset, stripeMetadata->footerLength);
-	stripeFooter = DeserializeStripeFooter(footerBuffer);
-	if (stripeFooter->columnCount != columnCount)
-	{
-		ereport(ERROR, (errmsg("stripe footer column count and table column count "
-							   "don't match")));
-	}
-
-	return stripeFooter;
-}
-
-
 /* Reads the skip list for the given stripe. */
 static StripeSkipList *
-LoadStripeSkipList(TableReadState *readState, StripeMetadata *stripeMetadata,
+LoadStripeSkipList(StripeMetadata *stripeMetadata,
 				   StripeFooter *stripeFooter, uint32 columnCount,
 				   Form_pg_attribute *attributeFormArray)
 {
 	StripeSkipList *stripeSkipList = NULL;
 	ColumnBlockSkipNode **blockSkipNodeArray = NULL;
-	StringInfo firstColumnSkipListBuffer = NULL;
-	uint64 currentColumnSkipListFileOffset = 0;
+	size_t currentColumnSkipListOffset = 0;
 	uint32 columnIndex = 0;
 	uint32 stripeBlockCount = 0;
-	rados_ioctx_t *ioctx = readState->ioctx;
-	StringInfo tableFilename = readState->tableFilename;
-	StringInfo objname;
-
-	objname = makeStringInfo();
-	appendStringInfo(objname, "%s.%llu", tableFilename->data, (long long)stripeMetadata->fileOffset);
 
 	/* deserialize block count */
-	firstColumnSkipListBuffer = ReadFromObject(ioctx, objname->data,
-			0, stripeFooter->skipListSizeArray[0]);
-	stripeBlockCount = DeserializeBlockCount(firstColumnSkipListBuffer);
+	stripeBlockCount = DeserializeBlockCount(stripeMetadata->skipListBuffer,
+			stripeFooter->skipListSizeArray[0]);
 
 	/* deserialize column skip lists */
 	blockSkipNodeArray = palloc0(columnCount * sizeof(ColumnBlockSkipNode *));
-	currentColumnSkipListFileOffset = 0;
+	currentColumnSkipListOffset = 0;
 
 	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
 	{
 		uint64 columnSkipListSize = stripeFooter->skipListSizeArray[columnIndex];
 		Form_pg_attribute attributeForm = attributeFormArray[columnIndex];
 
-		StringInfo columnSkipListBuffer =
-			ReadFromObject(ioctx, objname->data, currentColumnSkipListFileOffset, columnSkipListSize);
-
 		ColumnBlockSkipNode *columnSkipList =
-			DeserializeColumnSkipList(columnSkipListBuffer, attributeForm->attbyval,
-									  attributeForm->attlen, stripeBlockCount);
+			DeserializeColumnSkipList(stripeMetadata->skipListBuffer,
+					currentColumnSkipListOffset, columnSkipListSize,
+					attributeForm->attbyval, attributeForm->attlen, stripeBlockCount);
+
 		blockSkipNodeArray[columnIndex] = columnSkipList;
 
-		currentColumnSkipListFileOffset += columnSkipListSize;
+		currentColumnSkipListOffset += columnSkipListSize;
 	}
 
 	stripeSkipList = palloc0(sizeof(StripeSkipList));
