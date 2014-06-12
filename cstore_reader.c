@@ -651,6 +651,16 @@ LoadColumnData(uint32 columnIndex, StripeMetadata* stripeMetadata,
 	{
 		ColumnBlockData *blk = blockDataArray[blockIndex];
 
+		if (blk->exists_retval) {
+			ereport(ERROR, (errmsg("blk exists retval %d", blk->exists_retval)));
+		}
+
+		if (blk->exists_bytes_read != blk->existsLength) {
+			ereport(ERROR, (errmsg("blk exists read %u len %u",
+							(unsigned int)blk->exists_bytes_read,
+							(unsigned int)blk->existsLength)));
+		}
+
 		blk->existsArray = DeserializeBoolArray(blk->rawExistsBuffer, blk->rowCount);
 	}
 
@@ -658,6 +668,16 @@ LoadColumnData(uint32 columnIndex, StripeMetadata* stripeMetadata,
 	{
 		StringInfo valueBuffer;
 		ColumnBlockData *blk = blockDataArray[blockIndex];
+
+		if (blk->value_retval) {
+			ereport(ERROR, (errmsg("blk value retval %d", blk->value_retval)));
+		}
+
+		if (blk->value_bytes_read != blk->valueLength) {
+			ereport(ERROR, (errmsg("blk value read %u len %u",
+							(unsigned int)blk->value_bytes_read,
+							(unsigned int)blk->valueLength)));
+		}
 
 		valueBuffer = DecompressBuffer(blk->rawValueBuffer, blk->valueCompressionType);
 
