@@ -29,6 +29,7 @@
 #define OPTION_NAME_BLOCK_ROW_COUNT "block_row_count"
 #define OPTION_NAME_CEPH_CONF_FILE "ceph_conf"
 #define OPTION_NAME_CEPH_POOL_NAME "ceph_pool"
+#define OPTION_NAME_PREFETCH_BYTES "prefetch_bytes"
 
 /* Default values for option parameters */
 #define DEFAULT_COMPRESSION_TYPE COMPRESSION_NONE
@@ -73,7 +74,7 @@ typedef struct CStoreValidOption
 
 
 /* Array of options that are valid for cstore_fdw */
-static const uint32 ValidOptionCount = 6;
+static const uint32 ValidOptionCount = 7;
 static const CStoreValidOption ValidOptionArray[] =
 {
 	/* foreign table options */
@@ -82,7 +83,8 @@ static const CStoreValidOption ValidOptionArray[] =
 	{ OPTION_NAME_STRIPE_ROW_COUNT, ForeignTableRelationId },
 	{ OPTION_NAME_BLOCK_ROW_COUNT, ForeignTableRelationId },
 	{ OPTION_NAME_CEPH_CONF_FILE, ForeignTableRelationId },
-	{ OPTION_NAME_CEPH_POOL_NAME, ForeignTableRelationId }
+	{ OPTION_NAME_CEPH_POOL_NAME, ForeignTableRelationId },
+  { OPTION_NAME_PREFETCH_BYTES, ForeignTableRelationId }
 };
 
 
@@ -111,6 +113,7 @@ typedef struct CStoreFdwOptions
 	uint32 blockRowCount;
 	char *ceph_conf_file;
 	char *ceph_pool_name;
+  uint64 prefetch_bytes;
 
 } CStoreFdwOptions;
 
@@ -241,6 +244,7 @@ typedef struct StripeMetadata
 
   rados_completion_t data_completion;
   rados_read_op_t data_op;
+  uint64 total_bytes;
 
 } StripeMetadata;
 
@@ -278,6 +282,10 @@ typedef struct TableReadState
 	uint64 stripeReadRowCount;
 
   StripeMetadata *prevStripeMetadata;
+
+  uint32 prefetched_stripes;
+  uint64 prefetched_bytes; // how many have
+  uint64 prefetch_bytes; // how many should
 
 } TableReadState;
 
@@ -323,7 +331,7 @@ extern void CStoreWriteRow(TableWriteState *state, Datum *columnValues,
 extern void CStoreEndWrite(rados_ioctx_t *ioctx, TableWriteState * state);
 
 /* Function declarations for reading from a cstore file */
-extern TableReadState * CStoreBeginRead(const char *filename, rados_t *rados,
+extern TableReadState * CStoreBeginRead(const char *filename, uint64 prefetch_bytes, rados_t *rados,
     rados_ioctx_t *ioctx, TupleDesc tupleDescriptor, List *projectedColumnList,
     List *qualConditions);
 extern TableFooter *CStoreReadFooter(rados_ioctx_t *ioctx, StringInfo tableFooterFilename);

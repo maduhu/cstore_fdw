@@ -258,16 +258,16 @@ CStoreGetOptions(Oid foreignTableId)
 	char *blockRowCountString = NULL;
 	char *ceph_conf_file;
 	char *ceph_pool_name;
+	int64 prefetch_bytes;
+	char *prefetch_bytes_string;
 
 	objprefix = CStoreGetOptionValue(foreignTableId, OPTION_NAME_OBJPREFIX);
 	ceph_conf_file = CStoreGetOptionValue(foreignTableId, OPTION_NAME_CEPH_CONF_FILE);
 	ceph_pool_name = CStoreGetOptionValue(foreignTableId, OPTION_NAME_CEPH_POOL_NAME);
-	compressionTypeString = CStoreGetOptionValue(foreignTableId,
-												 OPTION_NAME_COMPRESSION_TYPE);
-	stripeRowCountString = CStoreGetOptionValue(foreignTableId,
-												OPTION_NAME_STRIPE_ROW_COUNT);
-	blockRowCountString = CStoreGetOptionValue(foreignTableId,
-											   OPTION_NAME_BLOCK_ROW_COUNT);
+	compressionTypeString = CStoreGetOptionValue(foreignTableId, OPTION_NAME_COMPRESSION_TYPE);
+	stripeRowCountString = CStoreGetOptionValue(foreignTableId, OPTION_NAME_STRIPE_ROW_COUNT);
+	blockRowCountString = CStoreGetOptionValue(foreignTableId, OPTION_NAME_BLOCK_ROW_COUNT);
+	prefetch_bytes_string = CStoreGetOptionValue(foreignTableId, OPTION_NAME_PREFETCH_BYTES);
 
 	ValidateForeignTableOptions(objprefix, ceph_conf_file, ceph_pool_name,
 			compressionTypeString, stripeRowCountString, blockRowCountString);
@@ -286,6 +286,13 @@ CStoreGetOptions(Oid foreignTableId)
 		blockRowCount = pg_atoi(blockRowCountString, sizeof(int32), 0);
 	}
 
+	if (prefetch_bytes_string) {
+		prefetch_bytes = atoll(prefetch_bytes_string);
+		if (prefetch_bytes < 0)
+			prefetch_bytes = 0;
+	} else
+		prefetch_bytes = 0;
+
 	cstoreFdwOptions = palloc0(sizeof(CStoreFdwOptions));
 	cstoreFdwOptions->objprefix = objprefix;
 	cstoreFdwOptions->compressionType = compressionType;
@@ -293,6 +300,7 @@ CStoreGetOptions(Oid foreignTableId)
 	cstoreFdwOptions->blockRowCount = blockRowCount;
 	cstoreFdwOptions->ceph_conf_file = ceph_conf_file;
 	cstoreFdwOptions->ceph_pool_name = ceph_pool_name;
+	cstoreFdwOptions->prefetch_bytes = (uint64)prefetch_bytes;
 
 	return cstoreFdwOptions;
 }
@@ -972,8 +980,8 @@ CStoreBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	whereClauseList = foreignScan->scan.plan.qual;
 
 	columnList = (List *) linitial(foreignPrivateList);
-	readState = CStoreBeginRead(cstoreFdwOptions->objprefix, rados, ioctx,
-			tupleDescriptor, columnList, whereClauseList);
+	readState = CStoreBeginRead(cstoreFdwOptions->objprefix, cstoreFdwOptions->prefetch_bytes,
+			rados, ioctx, tupleDescriptor, columnList, whereClauseList);
 
 	scanState->fdw_state = (void *) readState;
 }
