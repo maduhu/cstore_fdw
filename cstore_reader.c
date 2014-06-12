@@ -47,6 +47,8 @@ static void ReadStripeNextRow(StripeData *stripeData, List *projectedColumnList,
 							  Datum *columnValues, bool *columnNulls);
 static void LoadColumnData(uint32 columnIndex, StripeMetadata* stripeMetadata, TableReadState *readState,
 								   Form_pg_attribute attributeForm);
+static void SetupLoadColumnDataRead(uint32 columnIndex, StripeMetadata* stripeMetadata, TableReadState *readState,
+								   Form_pg_attribute attributeForm);
 static ColumnData * PreLoadColumnData(ColumnBlockSkipNode *blockSkipNodeArray,
 								   uint32 blockCount, uint64 existsFileOffset,
 								   uint64 valueFileOffset,
@@ -470,9 +472,51 @@ LoadFilteredStripeData(TableReadState *readState, StripeMetadata *stripeMetadata
 	uint32 columnIndex = 0;
 	Form_pg_attribute *attributeFormArray = tupleDescriptor->attrs;
 	uint32 columnCount = tupleDescriptor->natts;
+	rados_ioctx_t *ioctx = readState->ioctx;
+	int ret;
 
 	bool *projectedColumnMask = stripeMetadata->stripeData->projectedColumnMask;
 
+	stripeMetadata->data_op = rados_create_read_op();
+
+	// setup op
+	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
+	{
+		if (projectedColumnMask[columnIndex])
+		{
+			Form_pg_attribute attributeForm = attributeFormArray[columnIndex];
+
+			SetupLoadColumnDataRead(columnIndex, stripeMetadata, readState, attributeForm);
+		}
+	}
+
+	// run ops
+	ret = rados_aio_create_completion(stripeMetadata, read_stripe_complete,
+			read_stripe_complete, &stripeMetadata->data_completion);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not create aio completion for stripe data: ret=%d", ret)));
+	}
+
+	ret = rados_aio_read_op_operate(stripeMetadata->data_op,
+			*ioctx, stripeMetadata->data_completion,
+			stripeMetadata->stripeData->objname->data,
+			0);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not run stripe data read op: ret=%d", ret)));
+	}
+
+	ret = rados_aio_wait_for_complete(stripeMetadata->data_completion);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("wait for data complete: ret=%d", ret)));
+	}
+
+	rados_aio_release(stripeMetadata->data_completion);
+	rados_release_read_op(stripeMetadata->data_op);
+
+	// deserialize data
 	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
 	{
 		if (projectedColumnMask[columnIndex])
@@ -599,7 +643,6 @@ LoadColumnData(uint32 columnIndex, StripeMetadata* stripeMetadata,
 	const bool typeByValue = attributeForm->attbyval;
 	const int typeLength = attributeForm->attlen;
 	const char typeAlign = attributeForm->attalign;
-	rados_ioctx_t *ioctx = readState->ioctx;
 	uint32 blockCount = stripeMetadata->stripeData->blockCount;
 
 	ColumnBlockData **blockDataArray = stripeMetadata->stripeData->columnDataArray[columnIndex]->blockDataArray;
@@ -607,9 +650,6 @@ LoadColumnData(uint32 columnIndex, StripeMetadata* stripeMetadata,
 	for (blockIndex = 0; blockIndex < blockCount; blockIndex++)
 	{
 		ColumnBlockData *blk = blockDataArray[blockIndex];
-
-		blk->rawExistsBuffer = ReadFromObject(ioctx, stripeMetadata->stripeData->objname->data,
-				blk->existsOffset, blk->existsLength);
 
 		blk->existsArray = DeserializeBoolArray(blk->rawExistsBuffer, blk->rowCount);
 	}
@@ -619,13 +659,49 @@ LoadColumnData(uint32 columnIndex, StripeMetadata* stripeMetadata,
 		StringInfo valueBuffer;
 		ColumnBlockData *blk = blockDataArray[blockIndex];
 
-		blk->rawValueBuffer = ReadFromObject(ioctx, stripeMetadata->stripeData->objname->data,
-				blk->valueOffset, blk->valueLength);
-
 		valueBuffer = DecompressBuffer(blk->rawValueBuffer, blk->valueCompressionType);
 
 		blk->valueArray = DeserializeDatumArray(valueBuffer, blk->existsArray,
 				blk->rowCount, typeByValue, typeLength, typeAlign);
+	}
+
+}
+
+static void
+SetupLoadColumnDataRead(uint32 columnIndex, StripeMetadata* stripeMetadata,
+		TableReadState *readState,
+		Form_pg_attribute attributeForm)
+{
+	//ColumnData *columnData = NULL;
+	uint32 blockIndex = 0;
+	uint32 blockCount = stripeMetadata->stripeData->blockCount;
+
+	ColumnBlockData **blockDataArray = stripeMetadata->stripeData->columnDataArray[columnIndex]->blockDataArray;
+
+	for (blockIndex = 0; blockIndex < blockCount; blockIndex++)
+	{
+		ColumnBlockData *blk = blockDataArray[blockIndex];
+
+		blk->rawExistsBuffer = makeStringInfo();
+		enlargeStringInfo(blk->rawExistsBuffer, blk->existsLength);
+		blk->rawExistsBuffer->len = blk->existsLength;
+
+		rados_read_op_read(stripeMetadata->data_op, blk->existsOffset,
+				blk->existsLength, blk->rawExistsBuffer->data,
+				&blk->exists_bytes_read, &blk->exists_retval);
+	}
+
+	for (blockIndex = 0; blockIndex < blockCount; blockIndex++)
+	{
+		ColumnBlockData *blk = blockDataArray[blockIndex];
+
+		blk->rawValueBuffer = makeStringInfo();
+		enlargeStringInfo(blk->rawValueBuffer, blk->valueLength);
+		blk->rawValueBuffer->len = blk->valueLength;
+
+		rados_read_op_read(stripeMetadata->data_op, blk->valueOffset,
+				blk->valueLength, blk->rawValueBuffer->data,
+				&blk->value_bytes_read, &blk->value_retval);
 	}
 
 }

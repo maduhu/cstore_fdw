@@ -178,11 +178,16 @@ typedef struct ColumnBlockData
 	bool *existsArray;
 	Datum *valueArray;
 
-  StringInfo rawExistsBuffer, rawValueBuffer;
   uint64 existsOffset, existsLength;
   uint64 valueOffset, valueLength;
   uint32 rowCount;
 	CompressionType valueCompressionType;
+
+  StringInfo rawExistsBuffer, rawValueBuffer;
+  int exists_retval;
+  int value_retval;
+  size_t exists_bytes_read;
+  size_t value_bytes_read;
 
 } ColumnBlockData;
 
@@ -231,6 +236,9 @@ typedef struct StripeMetadata
   StripeFooter *stripeFooter;
   StripeSkipList *stripeSkipList;
   StripeData *stripeData;
+
+  rados_completion_t data_completion;
+  rados_read_op_t data_op;
 
 } StripeMetadata;
 
