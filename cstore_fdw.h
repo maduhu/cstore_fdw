@@ -168,38 +168,6 @@ typedef struct StripeSkipList
 } StripeSkipList;
 
 
-
-/*
- * StripeMetadata represents information about a stripe. This information is
- * stored in the cstore file's footer.
- */
-typedef struct StripeMetadata
-{
-	uint64 fileOffset;
-	uint64 skipListLength;
-	uint64 dataLength;
-	uint64 footerLength;
-
-  rados_completion_t sl_completion;
-  rados_completion_t ft_completion;
-  StringInfo skipListBuffer;
-  StringInfo footerBuffer;
-
-  StripeFooter *stripeFooter;
-  StripeSkipList *stripeSkipList;
-
-} StripeMetadata;
-
-
-/* TableFooter represents the footer of a cstore file. */
-typedef struct TableFooter
-{
-	List *stripeMetadataList;
-	uint64 blockRowCount;
-
-} TableFooter;
-
-
 /*
  * ColumnBlockData represents a block of data in a column. valueArray stores
  * the values of data, and existsArray stores whether a value is present.
@@ -209,6 +177,11 @@ typedef struct ColumnBlockData
 {
 	bool *existsArray;
 	Datum *valueArray;
+
+  StringInfo rawExistsBuffer, rawValueBuffer;
+  uint64 existsOffset, existsLength;
+  uint64 valueOffset, valueLength;
+  StringInfo objname;
 
 } ColumnBlockData;
 
@@ -232,6 +205,39 @@ typedef struct StripeData
 	ColumnData **columnDataArray;
 
 } StripeData;
+
+
+/*
+ * StripeMetadata represents information about a stripe. This information is
+ * stored in the cstore file's footer.
+ */
+typedef struct StripeMetadata
+{
+	uint64 fileOffset;
+	uint64 skipListLength;
+	uint64 dataLength;
+	uint64 footerLength;
+
+  rados_completion_t sl_completion;
+  rados_completion_t ft_completion;
+  StringInfo skipListBuffer;
+  StringInfo footerBuffer;
+
+  StripeFooter *stripeFooter;
+  StripeSkipList *stripeSkipList;
+  StripeData *stripeData;
+
+} StripeMetadata;
+
+
+/* TableFooter represents the footer of a cstore file. */
+typedef struct TableFooter
+{
+	List *stripeMetadataList;
+	uint64 blockRowCount;
+
+} TableFooter;
+
 
 
 /* TableReadState represents state of a cstore file read operation. */
