@@ -157,7 +157,6 @@ CStoreBeginRead(const char *filename, rados_t *rados, rados_ioctx_t *ioctx,
 	TableReadState *readState = NULL;
 	TableFooter *tableFooter = NULL;
 	StringInfo tableFilename = NULL;
-	MemoryContext stripeReadContext = NULL;
 	ListCell *stripeMetadataCell = NULL;
 
 	StringInfo tableFooterFilename = makeStringInfo();
@@ -276,18 +275,13 @@ CStoreBeginRead(const char *filename, rados_t *rados, rados_ioctx_t *ioctx,
 
 		stripeMetadata->stripeData = PreLoadFilteredStripeData(tableFilename, stripeMetadata,
 				tupleDescriptor, projectedColumnList, whereClauseList);
-	}
 
-	/*
-	 * We allocate all stripe specific data in the stripeReadContext, and reset
-	 * this memory context before loading a new stripe. This is to avoid memory
-	 * leaks.
-	 */
-	stripeReadContext = AllocSetContextCreate(CurrentMemoryContext,
-											  "Stripe Read Memory Context",
-											  ALLOCSET_DEFAULT_MINSIZE,
-											  ALLOCSET_DEFAULT_INITSIZE,
-											  ALLOCSET_DEFAULT_MAXSIZE);
+		stripeMetadata->stripeReadContext = AllocSetContextCreate(CurrentMemoryContext,
+				"Stripe Read Memory Context",
+					ALLOCSET_DEFAULT_MINSIZE,
+					ALLOCSET_DEFAULT_INITSIZE,
+					ALLOCSET_DEFAULT_MAXSIZE);
+	}
 
 	readState = palloc0(sizeof(TableReadState));
 	readState->tableFilename = tableFilename;
@@ -298,9 +292,9 @@ CStoreBeginRead(const char *filename, rados_t *rados, rados_ioctx_t *ioctx,
 	readState->readStripeCount = 0;
 	readState->stripeReadRowCount = 0;
 	readState->tupleDescriptor = tupleDescriptor;
-	readState->stripeReadContext = stripeReadContext;
 	readState->rados = rados;
 	readState->ioctx = ioctx;
+	readState->prevStripeMetadata = NULL;
 
 	return readState;
 }
@@ -331,16 +325,23 @@ CStoreReadNextRow(TableReadState *readState, Datum *columnValues, bool *columnNu
 		List *stripeMetadataList = tableFooter->stripeMetadataList;
 		uint32 stripeCount = list_length(stripeMetadataList);
 
+		if (readState->prevStripeMetadata) {
+			StripeMetadata *stripeMetadata = readState->prevStripeMetadata;
+			MemoryContextReset(stripeMetadata->stripeReadContext);
+			MemoryContextDelete(stripeMetadata->stripeReadContext);
+			readState->prevStripeMetadata = NULL;
+		}
+
 		/* if we have read all stripes, return false */
 		if (readState->readStripeCount == stripeCount)
 		{
 			return false;
 		}
 
-		oldContext = MemoryContextSwitchTo(readState->stripeReadContext);
-		MemoryContextReset(readState->stripeReadContext);
-
 		stripeMetadata = list_nth(stripeMetadataList, readState->readStripeCount);
+
+		oldContext = MemoryContextSwitchTo(stripeMetadata->stripeReadContext);
+
 		stripeData = LoadFilteredStripeData(readState, stripeMetadata, readState->tupleDescriptor);
 		readState->readStripeCount++;
 
@@ -348,10 +349,14 @@ CStoreReadNextRow(TableReadState *readState, Datum *columnValues, bool *columnNu
 
 		if (stripeData->rowCount != 0)
 		{
+			readState->prevStripeMetadata = stripeMetadata;
 			readState->stripeData = stripeData;
 			readState->stripeReadRowCount = 0;
 			break;
 		}
+
+		MemoryContextReset(stripeMetadata->stripeReadContext);
+		MemoryContextDelete(stripeMetadata->stripeReadContext);
 	}
 
 	blockIndex = readState->stripeReadRowCount / tableFooter->blockRowCount;
@@ -384,7 +389,6 @@ CStoreEndRead(TableReadState *readState)
 	if (readState->rados)
 		rados_shutdown(*readState->rados);
 
-	MemoryContextDelete(readState->stripeReadContext);
 	list_free_deep(readState->tableFooter->stripeMetadataList);
 	pfree(readState->tableFooter);
 	pfree(readState);

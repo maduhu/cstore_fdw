@@ -237,6 +237,8 @@ typedef struct StripeMetadata
   StripeSkipList *stripeSkipList;
   StripeData *stripeData;
 
+	MemoryContext stripeReadContext;
+
   rados_completion_t data_completion;
   rados_read_op_t data_op;
 
@@ -271,10 +273,11 @@ typedef struct TableReadState
   StringInfo tableFilename;
 
 	List *whereClauseList;
-	MemoryContext stripeReadContext;
 	StripeData *stripeData;
 	uint32 readStripeCount;
 	uint64 stripeReadRowCount;
+
+  StripeMetadata *prevStripeMetadata;
 
 } TableReadState;
 
