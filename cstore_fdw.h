@@ -181,7 +181,8 @@ typedef struct ColumnBlockData
   StringInfo rawExistsBuffer, rawValueBuffer;
   uint64 existsOffset, existsLength;
   uint64 valueOffset, valueLength;
-  StringInfo objname;
+  uint32 rowCount;
+	CompressionType valueCompressionType;
 
 } ColumnBlockData;
 
@@ -203,6 +204,10 @@ typedef struct StripeData
 	uint32 columnCount;
 	uint32 rowCount;
 	ColumnData **columnDataArray;
+
+  uint32 blockCount;
+  bool *projectedColumnMask;
+  StringInfo objname;
 
 } StripeData;
 

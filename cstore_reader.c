@@ -41,19 +41,13 @@ static StripeData * PreLoadFilteredStripeData(StringInfo tableFilename, StripeMe
 										   List *whereClauseList);
 static StripeData * LoadFilteredStripeData(TableReadState *readState,
 										   StripeMetadata *stripeMetadata,
-										   TupleDesc tupleDescriptor,
-										   List *projectedColumnList,
-										   List *whereClauseList);
+										   TupleDesc tupleDescriptor);
 static void ReadStripeNextRow(StripeData *stripeData, List *projectedColumnList,
 							  uint64 blockIndex, uint64 blockRowIndex,
 							  Datum *columnValues, bool *columnNulls);
-static ColumnData * LoadColumnData(TableReadState *readState, StringInfo objname,
-								   ColumnBlockSkipNode *blockSkipNodeArray,
-								   uint32 blockCount, uint64 existsFileOffset,
-								   uint64 valueFileOffset,
+static void LoadColumnData(uint32 columnIndex, StripeMetadata* stripeMetadata, TableReadState *readState,
 								   Form_pg_attribute attributeForm);
-static ColumnData * PreLoadColumnData(StringInfo objname,
-								   ColumnBlockSkipNode *blockSkipNodeArray,
+static ColumnData * PreLoadColumnData(ColumnBlockSkipNode *blockSkipNodeArray,
 								   uint32 blockCount, uint64 existsFileOffset,
 								   uint64 valueFileOffset,
 								   Form_pg_attribute attributeForm);
@@ -270,6 +264,9 @@ CStoreBeginRead(const char *filename, rados_t *rados, rados_ioctx_t *ioctx,
 							"don't match")));
 		}
 
+		rados_aio_release(stripeMetadata->sl_completion);
+		rados_aio_release(stripeMetadata->ft_completion);
+
 		stripeMetadata->stripeSkipList = LoadStripeSkipList(stripeMetadata,
 				stripeMetadata->stripeFooter,
 				tupleDescriptor->natts,
@@ -342,10 +339,7 @@ CStoreReadNextRow(TableReadState *readState, Datum *columnValues, bool *columnNu
 		MemoryContextReset(readState->stripeReadContext);
 
 		stripeMetadata = list_nth(stripeMetadataList, readState->readStripeCount);
-		stripeData = LoadFilteredStripeData(readState, stripeMetadata,
-											readState->tupleDescriptor,
-											readState->projectedColumnList,
-											readState->whereClauseList);
+		stripeData = LoadFilteredStripeData(readState, stripeMetadata, readState->tupleDescriptor);
 		readState->readStripeCount++;
 
 		MemoryContextSwitchTo(oldContext);
@@ -443,9 +437,8 @@ PreLoadFilteredStripeData(StringInfo tableFilename, StripeMetadata *stripeMetada
 			Form_pg_attribute attributeForm = attributeFormArray[columnIndex];
 			uint32 blockCount = selectedBlockSkipList->blockCount;
 
-			ColumnData *columnData = PreLoadColumnData(objname, blockSkipNode, blockCount,
-													existsFileOffset, valueFileOffset,
-													attributeForm);
+			ColumnData *columnData = PreLoadColumnData(blockSkipNode, blockCount,
+					existsFileOffset, valueFileOffset, attributeForm);
 
 			columnDataArray[columnIndex] = columnData;
 		}
@@ -458,6 +451,9 @@ PreLoadFilteredStripeData(StringInfo tableFilename, StripeMetadata *stripeMetada
 	stripeData->columnCount = columnCount;
 	stripeData->rowCount = StripeSkipListRowCount(selectedBlockSkipList);
 	stripeData->columnDataArray = columnDataArray;
+	stripeData->blockCount = selectedBlockSkipList->blockCount;
+	stripeData->projectedColumnMask = projectedColumnMask;
+	stripeData->objname = objname;
 
 	return stripeData;
 }
@@ -469,66 +465,25 @@ PreLoadFilteredStripeData(StringInfo tableFilename, StripeMetadata *stripeMetada
  * and only loads columns that are projected in the query.
  */
 static StripeData *
-LoadFilteredStripeData(TableReadState *readState, StripeMetadata *stripeMetadata,
-					   TupleDesc tupleDescriptor, List *projectedColumnList,
-					   List *whereClauseList)
+LoadFilteredStripeData(TableReadState *readState, StripeMetadata *stripeMetadata, TupleDesc tupleDescriptor)
 {
-	StripeData *stripeData = NULL;
-	ColumnData **columnDataArray = NULL;
-	uint64 currentColumnFileOffset = 0;
 	uint32 columnIndex = 0;
 	Form_pg_attribute *attributeFormArray = tupleDescriptor->attrs;
 	uint32 columnCount = tupleDescriptor->natts;
-	StringInfo objname;
 
-	StripeFooter *stripeFooter = stripeMetadata->stripeFooter;
-	StripeSkipList *stripeSkipList = stripeMetadata->stripeSkipList;
-
-	bool *projectedColumnMask = ProjectedColumnMask(columnCount, projectedColumnList);
-	bool *selectedBlockMask = SelectedBlockMask(stripeSkipList, projectedColumnList,
-												whereClauseList);
-
-	StripeSkipList *selectedBlockSkipList = SelectedBlockSkipList(stripeSkipList,
-																  selectedBlockMask);
-	objname = makeStringInfo();
-	appendStringInfo(objname, "%s.%llu", readState->tableFilename->data, (long long)stripeMetadata->fileOffset);
-
-	/* load column data for projected columns */
-	columnDataArray = palloc0(columnCount * sizeof(ColumnData *));
-	//currentColumnFileOffset = stripeMetadata->fileOffset + stripeMetadata->skipListLength;
-	currentColumnFileOffset = stripeMetadata->skipListLength;
+	bool *projectedColumnMask = stripeMetadata->stripeData->projectedColumnMask;
 
 	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
 	{
-		uint64 existsSize = stripeFooter->existsSizeArray[columnIndex];
-		uint64 valueSize = stripeFooter->valueSizeArray[columnIndex];
-		uint64 existsFileOffset = currentColumnFileOffset;
-		uint64 valueFileOffset = currentColumnFileOffset + existsSize;
-
 		if (projectedColumnMask[columnIndex])
 		{
-			ColumnBlockSkipNode *blockSkipNode =
-				selectedBlockSkipList->blockSkipNodeArray[columnIndex];
 			Form_pg_attribute attributeForm = attributeFormArray[columnIndex];
-			uint32 blockCount = selectedBlockSkipList->blockCount;
 
-			ColumnData *columnData = LoadColumnData(readState, objname, blockSkipNode, blockCount,
-													existsFileOffset, valueFileOffset,
-													attributeForm);
-
-			columnDataArray[columnIndex] = columnData;
+			LoadColumnData(columnIndex, stripeMetadata, readState, attributeForm);
 		}
-
-		currentColumnFileOffset += existsSize;
-		currentColumnFileOffset += valueSize;
 	}
 
-	stripeData = palloc0(sizeof(StripeData));
-	stripeData->columnCount = columnCount;
-	stripeData->rowCount = StripeSkipListRowCount(selectedBlockSkipList);
-	stripeData->columnDataArray = columnDataArray;
-
-	return stripeData;
+	return stripeMetadata->stripeData;
 }
 
 
@@ -568,7 +523,7 @@ ReadStripeNextRow(StripeData *stripeData, List *projectedColumnList,
  * and lengths are retrieved from the column block skip node array.
  */
 static ColumnData *
-PreLoadColumnData(StringInfo objname, ColumnBlockSkipNode *blockSkipNodeArray,
+PreLoadColumnData(ColumnBlockSkipNode *blockSkipNodeArray,
 			   uint32 blockCount, uint64 existsFileOffset, uint64 valueFileOffset,
 			   Form_pg_attribute attributeForm)
 {
@@ -592,14 +547,12 @@ PreLoadColumnData(StringInfo objname, ColumnBlockSkipNode *blockSkipNodeArray,
 	for (blockIndex = 0; blockIndex < blockCount; blockIndex++)
 	{
 		ColumnBlockSkipNode *blockSkipNode = &blockSkipNodeArray[blockIndex];
-		//uint32 rowCount = blockSkipNode->rowCount;
+		uint32 rowCount = blockSkipNode->rowCount;
 		uint64 existsOffset = existsFileOffset + blockSkipNode->existsBlockOffset;
-
-		// common to exists and values
-		blockDataArray[blockIndex]->objname = objname;
 
 		blockDataArray[blockIndex]->existsOffset = existsOffset;
 		blockDataArray[blockIndex]->existsLength = blockSkipNode->existsLength;
+		blockDataArray[blockIndex]->rowCount = rowCount;
 
 		//bool *existsArray = DeserializeBoolArray(rawExistsBuffer, rowCount);
 		//blockDataArray[blockIndex]->existsArray = existsArray;
@@ -615,6 +568,7 @@ PreLoadColumnData(StringInfo objname, ColumnBlockSkipNode *blockSkipNodeArray,
 
 		blockDataArray[blockIndex]->valueOffset = valueOffset;
 		blockDataArray[blockIndex]->valueLength = blockSkipNode->valueLength;
+		blockDataArray[blockIndex]->valueCompressionType = blockSkipNode->valueCompressionType;
 
 		//StringInfo valueBuffer = DecompressBuffer(rawValueBuffer,
 		//										  blockSkipNode->valueCompressionType);
@@ -635,68 +589,45 @@ PreLoadColumnData(StringInfo objname, ColumnBlockSkipNode *blockSkipNodeArray,
  * column data are laid out as sequential blocks in the file; and block positions
  * and lengths are retrieved from the column block skip node array.
  */
-static ColumnData *
-LoadColumnData(TableReadState *readState, StringInfo objname, ColumnBlockSkipNode *blockSkipNodeArray,
-			   uint32 blockCount, uint64 existsFileOffset, uint64 valueFileOffset,
-			   Form_pg_attribute attributeForm)
+static void
+LoadColumnData(uint32 columnIndex, StripeMetadata* stripeMetadata,
+		TableReadState *readState,
+		Form_pg_attribute attributeForm)
 {
-	ColumnData *columnData = NULL;
+	//ColumnData *columnData = NULL;
 	uint32 blockIndex = 0;
 	const bool typeByValue = attributeForm->attbyval;
 	const int typeLength = attributeForm->attlen;
 	const char typeAlign = attributeForm->attalign;
 	rados_ioctx_t *ioctx = readState->ioctx;
-	//StringInfo tableFilename = readState->tableFilename;
+	uint32 blockCount = stripeMetadata->stripeData->blockCount;
 
-	ColumnBlockData **blockDataArray = palloc0(blockCount * sizeof(ColumnBlockData *));
+	ColumnBlockData **blockDataArray = stripeMetadata->stripeData->columnDataArray[columnIndex]->blockDataArray;
+
 	for (blockIndex = 0; blockIndex < blockCount; blockIndex++)
 	{
-		blockDataArray[blockIndex] = palloc0(sizeof(ColumnBlockData));
+		ColumnBlockData *blk = blockDataArray[blockIndex];
+
+		blk->rawExistsBuffer = ReadFromObject(ioctx, stripeMetadata->stripeData->objname->data,
+				blk->existsOffset, blk->existsLength);
+
+		blk->existsArray = DeserializeBoolArray(blk->rawExistsBuffer, blk->rowCount);
 	}
 
-	/*
-	 * We first read the "exists" blocks. We don't read "values" array here,
-	 * because "exists" blocks are stored sequentially on disk, and we want to
-	 * minimize disk seeks.
-	 */
 	for (blockIndex = 0; blockIndex < blockCount; blockIndex++)
 	{
-		ColumnBlockSkipNode *blockSkipNode = &blockSkipNodeArray[blockIndex];
-		uint32 rowCount = blockSkipNode->rowCount;
-		uint64 existsOffset = existsFileOffset + blockSkipNode->existsBlockOffset;
-		//StringInfo rawExistsBuffer = ReadFromObject(ioctx, tableFilename->data,
-		//		existsOffset, blockSkipNode->existsLength);
-		StringInfo rawExistsBuffer = ReadFromObject(ioctx, objname->data,
-				existsOffset, blockSkipNode->existsLength);
+		StringInfo valueBuffer;
+		ColumnBlockData *blk = blockDataArray[blockIndex];
 
-		bool *existsArray = DeserializeBoolArray(rawExistsBuffer, rowCount);
-		blockDataArray[blockIndex]->existsArray = existsArray;
+		blk->rawValueBuffer = ReadFromObject(ioctx, stripeMetadata->stripeData->objname->data,
+				blk->valueOffset, blk->valueLength);
+
+		valueBuffer = DecompressBuffer(blk->rawValueBuffer, blk->valueCompressionType);
+
+		blk->valueArray = DeserializeDatumArray(valueBuffer, blk->existsArray,
+				blk->rowCount, typeByValue, typeLength, typeAlign);
 	}
 
-	/* then read "values" blocks, which are also stored sequentially on disk */
-	for (blockIndex = 0; blockIndex < blockCount; blockIndex++)
-	{
-		ColumnBlockSkipNode *blockSkipNode = &blockSkipNodeArray[blockIndex];
-		uint32 rowCount = blockSkipNode->rowCount;
-		bool *existsArray = blockDataArray[blockIndex]->existsArray;
-		uint64 valueOffset = valueFileOffset + blockSkipNode->valueBlockOffset;
-		//StringInfo rawValueBuffer = ReadFromObject(ioctx, tableFilename->data,
-		//		valueOffset, blockSkipNode->valueLength);
-		StringInfo rawValueBuffer = ReadFromObject(ioctx, objname->data,
-				valueOffset, blockSkipNode->valueLength);
-		StringInfo valueBuffer = DecompressBuffer(rawValueBuffer,
-												  blockSkipNode->valueCompressionType);
-
-		Datum *valueArray = DeserializeDatumArray(valueBuffer, existsArray,
-												  rowCount, typeByValue, typeLength,
-												  typeAlign);
-		blockDataArray[blockIndex]->valueArray = valueArray;
-	}
-
-	columnData = palloc0(sizeof(ColumnData));
-	columnData->blockDataArray = blockDataArray;
-
-	return columnData;
 }
 
 
