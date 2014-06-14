@@ -939,7 +939,7 @@ CStoreExplainForeignScan(ForeignScanState *scanState, ExplainState *explainState
 	{
 		uint64 size;
 
-		int ret = CalcRelSize(cstoreFdwOptions->objprefix, ioctx, &size);
+		int ret = CalcRelSize(cstoreFdwOptions->objprefix, &ioctx, &size);
 		if (ret == 0)
 		{
 			ExplainPropertyLong("CStore File Size", (long) size,
