@@ -200,6 +200,7 @@ CStoreBeginWrite(const char *objprefix, rados_ioctx_t *ioctx,
 	writeState->stripeSkipList = NULL;
 	writeState->stripeWriteContext = stripeWriteContext;
 	writeState->ioctx = ioctx;
+	writeState->relsize = 0;
 
 	return writeState;
 }
@@ -308,6 +309,7 @@ CStoreWriteRow(TableWriteState *writeState, Datum *columnValues, bool *columnNul
 void
 CStoreEndWrite(rados_ioctx_t *ioctx, TableWriteState *writeState)
 {
+	StringInfo size_objname;
 	StringInfo tableFooterFilename = NULL;
 
 	StripeData *stripeData = writeState->stripeData;
@@ -325,6 +327,20 @@ CStoreEndWrite(rados_ioctx_t *ioctx, TableWriteState *writeState)
 	tableFooterFilename = writeState->tableFooterFilename;
 	CStoreWriteFooter(ioctx, tableFooterFilename, writeState->tableFooter);
 
+	size_objname = makeStringInfo();
+	appendStringInfo(size_objname, "%s.relsize", writeState->tableFilename->data);
+
+	// this isn't portable, but then again, this is POC
+	// FIXME: this also doesn't work if you import tables in multiple COPY
+	// steps as it will overwrite the size with the COPY size.
+	WriteToObject(writeState->ioctx, size_objname->data,
+			&writeState->relsize, sizeof(writeState->relsize), 0);
+
+	ereport(INFO, (errmsg("relsize %s:%llu", size_objname->data, writeState->relsize)));
+
+	pfree(size_objname->data);
+	pfree(size_objname);
+
 	MemoryContextDelete(writeState->stripeWriteContext);
 	list_free_deep(writeState->tableFooter->stripeMetadataList);
 	pfree(writeState->tableFooter);
@@ -332,6 +348,7 @@ CStoreEndWrite(rados_ioctx_t *ioctx, TableWriteState *writeState)
 	pfree(writeState->tableFooterFilename);
 	pfree(writeState->comparisonFunctionArray);
 	pfree(writeState);
+
 }
 
 /*
@@ -562,6 +579,7 @@ FlushStripe(TableWriteState *writeState)
 		StringInfo skipListBuffer = skipListBufferArray[columnIndex];
 		WriteToObject(ioctx, objname->data, skipListBuffer->data,
 				skipListBuffer->len, objoffset);
+		writeState->relsize += skipListBuffer->len;
 		objoffset += skipListBuffer->len;
 	}
 
@@ -574,6 +592,7 @@ FlushStripe(TableWriteState *writeState)
 			StringInfo existsBuffer = existsBufferArray[columnIndex][blockIndex];
 			WriteToObject(ioctx, objname->data, existsBuffer->data,
 					existsBuffer->len, objoffset);
+			writeState->relsize += existsBuffer->len;
 			objoffset += existsBuffer->len;
 		}
 
@@ -582,6 +601,7 @@ FlushStripe(TableWriteState *writeState)
 			StringInfo valueBuffer = valueBufferArray[columnIndex][blockIndex];
 			WriteToObject(ioctx, objname->data, valueBuffer->data,
 					valueBuffer->len, objoffset);
+			writeState->relsize += valueBuffer->len;
 			objoffset += valueBuffer->len;
 		}
 	}
@@ -589,6 +609,7 @@ FlushStripe(TableWriteState *writeState)
 	/* finally, we flush the footer buffer */
 	WriteToObject(ioctx, objname->data, stripeFooterBuffer->data,
 			stripeFooterBuffer->len, objoffset);
+	writeState->relsize += stripeFooterBuffer->len;
 	objoffset += stripeFooterBuffer->len;
 
 

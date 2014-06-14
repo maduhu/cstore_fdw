@@ -32,7 +32,8 @@
 #include "utils/lsyscache.h"
 #include "utils/pg_lzcompress.h"
 #include "utils/rel.h"
-
+#include "portability/instr_time.h"
+#include <unistd.h>
 
 /* static function declarations */
 static StripeData * PreLoadFilteredStripeData(StringInfo tableFilename, StripeMetadata *stripeMetadata,
@@ -160,6 +161,7 @@ CStoreBeginRead(const char *filename, uint64 prefetch_bytes, rados_t *rados, rad
 	TableFooter *tableFooter = NULL;
 	StringInfo tableFilename = NULL;
 	ListCell *stripeMetadataCell = NULL;
+	MemoryContext oldContext = NULL;
 
 	StringInfo tableFooterFilename = makeStringInfo();
 	appendStringInfo(tableFooterFilename, "%s%s", filename, CSTORE_FOOTER_FILE_SUFFIX);
@@ -179,6 +181,14 @@ CStoreBeginRead(const char *filename, uint64 prefetch_bytes, rados_t *rados, rad
 		StripeMetadata *stripeMetadata = lfirst(stripeMetadataCell);
 		StringInfo objname = makeStringInfo();
 		int ret;
+
+		stripeMetadata->stripeReadContext = AllocSetContextCreate(CurrentMemoryContext,
+				"Stripe Read Memory Context",
+					ALLOCSET_DEFAULT_MINSIZE,
+					ALLOCSET_DEFAULT_INITSIZE,
+					ALLOCSET_DEFAULT_MAXSIZE);
+
+		oldContext = MemoryContextSwitchTo(stripeMetadata->stripeReadContext);
 
 		// buffer for skiplist blob
 		stripeMetadata->skipListBuffer = makeStringInfo();
@@ -227,6 +237,8 @@ CStoreBeginRead(const char *filename, uint64 prefetch_bytes, rados_t *rados, rad
 
 		pfree(objname->data);
 		pfree(objname);
+
+		MemoryContextSwitchTo(oldContext);
 	}
 
 	/*
@@ -235,6 +247,8 @@ CStoreBeginRead(const char *filename, uint64 prefetch_bytes, rados_t *rados, rad
 	foreach(stripeMetadataCell, tableFooter->stripeMetadataList) {
 		StripeMetadata *stripeMetadata = lfirst(stripeMetadataCell);
 		int ret;
+
+		oldContext = MemoryContextSwitchTo(stripeMetadata->stripeReadContext);
 
 		ret = rados_aio_wait_for_complete(stripeMetadata->ft_completion);
 		if (ret) {
@@ -278,12 +292,6 @@ CStoreBeginRead(const char *filename, uint64 prefetch_bytes, rados_t *rados, rad
 		stripeMetadata->stripeData = PreLoadFilteredStripeData(tableFilename, stripeMetadata,
 				tupleDescriptor, projectedColumnList, whereClauseList);
 
-		stripeMetadata->stripeReadContext = AllocSetContextCreate(CurrentMemoryContext,
-				"Stripe Read Memory Context",
-					ALLOCSET_DEFAULT_MINSIZE,
-					ALLOCSET_DEFAULT_INITSIZE,
-					ALLOCSET_DEFAULT_MAXSIZE);
-
 		stripeMetadata->data_op = rados_create_read_op();
 
 		ret = rados_aio_create_completion(stripeMetadata, read_stripe_complete,
@@ -292,6 +300,8 @@ CStoreBeginRead(const char *filename, uint64 prefetch_bytes, rados_t *rados, rad
 			ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
 				errmsg("could not create aio completion for stripe data: ret=%d", ret)));
 		}
+
+		MemoryContextSwitchTo(oldContext);
 	}
 
 	readState = palloc0(sizeof(TableReadState));
@@ -309,6 +319,7 @@ CStoreBeginRead(const char *filename, uint64 prefetch_bytes, rados_t *rados, rad
 	readState->prefetched_bytes = 0;
 	readState->prefetched_stripes = 0;
 	readState->prefetch_bytes = prefetch_bytes;
+	readState->io_wait_time = 0.0f;
 
 	return readState;
 }
@@ -370,8 +381,6 @@ CStoreReadNextRow(TableReadState *readState, Datum *columnValues, bool *columnNu
 			readState->prefetched_bytes += bytes_prefetched;
 
 			stripeMetadata->total_bytes = bytes_prefetched;
-
-			ereport(INFO, (errmsg("dispatching reads..")));
 		}
 
 		/* if we have read all stripes, return false */
@@ -385,7 +394,6 @@ CStoreReadNextRow(TableReadState *readState, Datum *columnValues, bool *columnNu
 		oldContext = MemoryContextSwitchTo(stripeMetadata->stripeReadContext);
 
 		stripeData = LoadFilteredStripeData(readState, stripeMetadata, readState->tupleDescriptor);
-		ereport(INFO, (errmsg("completing reads..")));
 		readState->readStripeCount++;
 
 		MemoryContextSwitchTo(oldContext);
@@ -431,6 +439,8 @@ CStoreEndRead(TableReadState *readState)
 
 	if (readState->rados)
 		rados_shutdown(*readState->rados);
+
+	ereport(INFO, (errmsg("io wait time %g", readState->io_wait_time)));
 
 	list_free_deep(readState->tableFooter->stripeMetadataList);
 	pfree(readState->tableFooter);
@@ -552,17 +562,21 @@ LoadFilteredStripeData(TableReadState *readState, StripeMetadata *stripeMetadata
 	uint32 columnIndex = 0;
 	Form_pg_attribute *attributeFormArray = tupleDescriptor->attrs;
 	uint32 columnCount = tupleDescriptor->natts;
+	instr_time starttime, endtime;
 	int ret;
 
 	bool *projectedColumnMask = stripeMetadata->stripeData->projectedColumnMask;
 
 	// wait on the stripe to finish loading
-
+	INSTR_TIME_SET_CURRENT(starttime);
 	ret = rados_aio_wait_for_complete(stripeMetadata->data_completion);
 	if (ret) {
 		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
 			errmsg("wait for data complete: ret=%d", ret)));
 	}
+	INSTR_TIME_SET_CURRENT(endtime);
+	INSTR_TIME_SUBTRACT(endtime, starttime);
+	readState->io_wait_time += INSTR_TIME_GET_DOUBLE(endtime);
 
 	rados_aio_release(stripeMetadata->data_completion);
 	rados_release_read_op(stripeMetadata->data_op);

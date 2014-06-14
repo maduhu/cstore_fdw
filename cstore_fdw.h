@@ -287,6 +287,8 @@ typedef struct TableReadState
   uint64 prefetched_bytes; // how many have
   uint64 prefetch_bytes; // how many should
 
+  double io_wait_time;
+
 } TableReadState;
 
 
@@ -308,6 +310,8 @@ typedef struct TableWriteState
 	StripeData *stripeData;
 	StripeSkipList *stripeSkipList;
 	uint32 stripeMaxRowCount;
+
+  uint64 relsize;
 
 } TableWriteState;
 

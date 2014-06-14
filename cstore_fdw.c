@@ -543,6 +543,33 @@ cstore_fdw_validator(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+static int
+CalcRelSize(const char *objprefix, rados_ioctx_t *ioctx, uint64 *size)
+{
+	uint64 rsize;
+	StringInfo size_objname;
+	int ret;
+
+	size_objname = makeStringInfo();
+	appendStringInfo(size_objname, "%s.relsize", objprefix);
+
+	ret = rados_stat(*ioctx, size_objname->data, NULL, NULL);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = rados_read(*ioctx, size_objname->data, (void*)&rsize, sizeof(uint64), 0);
+	if (ret != sizeof(uint64)) {
+		ereport(ERROR, (errmsg("invalid size obj %s", size_objname->data)));
+		return -EINVAL;
+	}
+
+	*size = rsize;
+
+
+	return 0;
+}
+
 /* PageCount calculates and returns the number of pages in a file. */
 static BlockNumber
 PageCount(const char *objprefix, rados_ioctx_t *ioctx)
@@ -551,7 +578,7 @@ PageCount(const char *objprefix, rados_ioctx_t *ioctx)
 	uint64 size;
 
 	/* if file doesn't exist at plan time, use default estimate for its size */
-	int ret = rados_stat(*ioctx, objprefix, &size, NULL);
+	int ret = CalcRelSize(objprefix, ioctx, &size);
 	if (ret < 0)
 	{
 		size = 10 * BLCKSZ;
@@ -562,6 +589,8 @@ PageCount(const char *objprefix, rados_ioctx_t *ioctx)
 	{
 		pageCount = 1;
 	}
+
+//	ereport(INFO, (errmsg("page count %s:%u", objprefix, pageCount)));
 
 	return pageCount;
 }
@@ -598,7 +627,7 @@ TupleCountEstimate(RelOptInfo *baserel, const char *objprefix, rados_ioctx_t *io
 		uint64 size;
 		int tupleWidth = 0;
 
-		int ret = rados_stat(*ioctx, objprefix, &size, NULL);
+		int ret = CalcRelSize(objprefix, ioctx, &size);
 		if (ret < 0)
 		{
 			/* file may not be there at plan time, so use a default estimate */
@@ -610,6 +639,7 @@ TupleCountEstimate(RelOptInfo *baserel, const char *objprefix, rados_ioctx_t *io
 		tupleCountEstimate = clamp_row_est(tupleCountEstimate);
 	}
 
+//	ereport(INFO, (errmsg("tuple est %s:%llu", objprefix, (uint64)tupleCountEstimate)));
 	return tupleCountEstimate;
 }
 
@@ -909,7 +939,7 @@ CStoreExplainForeignScan(ForeignScanState *scanState, ExplainState *explainState
 	{
 		uint64 size;
 
-		int ret = rados_stat(ioctx, cstoreFdwOptions->objprefix, &size, NULL);
+		int ret = CalcRelSize(cstoreFdwOptions->objprefix, ioctx, &size);
 		if (ret == 0)
 		{
 			ExplainPropertyLong("CStore File Size", (long) size,
@@ -1225,7 +1255,6 @@ CStoreAnalyzeForeignTable(Relation relation,
 	CStoreFdwOptions *cstoreFdwOptions = CStoreGetOptions(foreignTableId);
 	rados_t rados;
 	rados_ioctx_t ioctx;
-	uint64 size;
 	int ret;
 
 	ret = rados_create(&rados, "admin");
@@ -1253,12 +1282,12 @@ CStoreAnalyzeForeignTable(Relation relation,
 				cstoreFdwOptions->ceph_pool_name, ret)));
 	}
 
-	ret = rados_stat(ioctx, cstoreFdwOptions->objprefix, &size, NULL);
-	if (ret < 0)
-	{
-		ereport(ERROR, (errmsg("could not stat file \"%s\": %m",
-							   cstoreFdwOptions->objprefix)));
-	}
+	//ret = rados_stat(ioctx, cstoreFdwOptions->objprefix, NULL, NULL);
+	//if (ret < 0)
+	//{
+	//	ereport(ERROR, (errmsg("could not stat file \"%s\": %m",
+	//						   cstoreFdwOptions->objprefix)));
+	//}
 
 	(*totalPageCount) = PageCount(cstoreFdwOptions->objprefix, &ioctx);
 	(*acquireSampleRowsFunc) = CStoreAcquireSampleRows;
