@@ -76,19 +76,38 @@ static void DeserializeDatumArray(StringInfo datumBuffer, bool *existsArray,
 static void DeserializeBlockData(StripeBuffers *stripeBuffers, uint64 blockIndex,
 								 Form_pg_attribute *attributeFormArray,
 								 uint32 rowCount, ColumnBlockData **blockDataArray);
-static int64 FileSize(FILE *file);
 static StringInfo ReadFromFile(FILE *file, uint64 offset, uint32 size);
 static StringInfo DecompressBuffer(StringInfo buffer, CompressionType compressionType);
 static void ResetUncompressedBlockData(ColumnBlockData **blockDataArray,
 									   uint32 columnCount);
 
+static StringInfo
+ReadFromObject(rados_ioctx_t *ioctx, const char *oid, uint64 offset, uint32 size)
+{
+	StringInfo resultBuffer;
+	int ret;
+
+	resultBuffer = makeStringInfo();
+	enlargeStringInfo(resultBuffer, size);
+	resultBuffer->len = size;
+
+	if (size == 0)
+		return resultBuffer;
+
+	ret = rados_read(*ioctx, oid, resultBuffer->data, size, offset);
+	if (ret < 0 || ret != size) {
+		ereport(ERROR, (errmsg("could not read enough data from file: ret=%d", ret)));
+	}
+
+	return resultBuffer;
+}
 
 /*
  * CStoreBeginRead initializes a cstore read operation. This function returns a
  * read handle that's used during reading rows and finishing the read operation.
  */
 TableReadState *
-CStoreBeginRead(const char *filename, TupleDesc tupleDescriptor,
+CStoreBeginRead(const char *filename, rados_t *rados, rados_ioctx_t *ioctx, TupleDesc tupleDescriptor,
 				List *projectedColumnList, List *whereClauseList)
 {
 	TableReadState *readState = NULL;
@@ -102,7 +121,7 @@ CStoreBeginRead(const char *filename, TupleDesc tupleDescriptor,
 	StringInfo tableFooterFilename = makeStringInfo();
 	appendStringInfo(tableFooterFilename, "%s%s", filename, CSTORE_FOOTER_FILE_SUFFIX);
 
-	tableFooter = CStoreReadFooter(tableFooterFilename);
+	tableFooter = CStoreReadFooter(ioctx, tableFooterFilename);
 
 	pfree(tableFooterFilename->data);
 	pfree(tableFooterFilename);
@@ -143,6 +162,8 @@ CStoreBeginRead(const char *filename, TupleDesc tupleDescriptor,
 	readState->stripeReadContext = stripeReadContext;
 	readState->blockDataArray = blockDataArray;
 	readState->deserializedBlockIndex = -1;
+	readState->rados = rados;
+	readState->ioctx = ioctx;
 
 	return readState;
 }
@@ -155,10 +176,9 @@ CStoreBeginRead(const char *filename, TupleDesc tupleDescriptor,
  * footer.
  */
 TableFooter *
-CStoreReadFooter(StringInfo tableFooterFilename)
+CStoreReadFooter(rados_ioctx_t *ioctx, StringInfo tableFooterFilename)
 {
 	TableFooter *tableFooter = NULL;
-	FILE *tableFooterFile = NULL;
 	uint64 footerOffset = 0;
 	uint64 footerLength = 0;
 	StringInfo postscriptBuffer = NULL;
@@ -168,25 +188,20 @@ CStoreReadFooter(StringInfo tableFooterFilename)
 	uint64 footerFileSize = 0;
 	uint64 postscriptOffset = 0;
 	StringInfo footerBuffer = NULL;
-	int freeResult = 0;
+	int ret;
 
-	tableFooterFile = AllocateFile(tableFooterFilename->data, PG_BINARY_R);
-	if (tableFooterFile == NULL)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not open file \"%s\" for reading: %m",
-							   tableFooterFilename->data),
-						errhint("Try copying in data to the table.")));
+	ret = rados_stat(*ioctx, tableFooterFilename->data, &footerFileSize, NULL);
+	if (ret) {
+		ereport(ERROR, (errmsg("could not stat object")));
 	}
 
-	footerFileSize = FileSize(tableFooterFile);
 	if (footerFileSize < CSTORE_POSTSCRIPT_SIZE_LENGTH)
 	{
 		ereport(ERROR, (errmsg("invalid cstore file")));
 	}
 
 	postscriptSizeOffset = footerFileSize - CSTORE_POSTSCRIPT_SIZE_LENGTH;
-	postscriptSizeBuffer = ReadFromFile(tableFooterFile, postscriptSizeOffset,
+	postscriptSizeBuffer = ReadFromObject(ioctx, tableFooterFilename->data, postscriptSizeOffset,
 										CSTORE_POSTSCRIPT_SIZE_LENGTH);
 	memcpy(&postscriptSize, postscriptSizeBuffer->data, CSTORE_POSTSCRIPT_SIZE_LENGTH);
 	if (postscriptSize + CSTORE_POSTSCRIPT_SIZE_LENGTH > footerFileSize)
@@ -195,7 +210,7 @@ CStoreReadFooter(StringInfo tableFooterFilename)
 	}
 
 	postscriptOffset = footerFileSize - (CSTORE_POSTSCRIPT_SIZE_LENGTH + postscriptSize);
-	postscriptBuffer = ReadFromFile(tableFooterFile, postscriptOffset, postscriptSize);
+	postscriptBuffer = ReadFromObject(ioctx, tableFooterFilename->data, postscriptOffset, postscriptSize);
 
 	DeserializePostScript(postscriptBuffer, &footerLength);
 	if (footerLength + postscriptSize + CSTORE_POSTSCRIPT_SIZE_LENGTH > footerFileSize)
@@ -204,15 +219,8 @@ CStoreReadFooter(StringInfo tableFooterFilename)
 	}
 
 	footerOffset = postscriptOffset - footerLength;
-	footerBuffer = ReadFromFile(tableFooterFile, footerOffset, footerLength);
+	footerBuffer = ReadFromObject(ioctx, tableFooterFilename->data, footerOffset, footerLength);
 	tableFooter = DeserializeTableFooter(footerBuffer);
-
-	freeResult = FreeFile(tableFooterFile);
-	if (freeResult != 0)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not close file: %m")));
-	}
 
 	return tableFooter;
 }
@@ -327,6 +335,12 @@ void
 CStoreEndRead(TableReadState *readState)
 {
 	int columnCount = readState->tupleDescriptor->natts;
+
+	if (readState->ioctx)
+		rados_ioctx_destroy(*readState->ioctx);
+
+	if (readState->rados)
+		rados_shutdown(*readState->rados);
 
 	MemoryContextDelete(readState->stripeReadContext);
 	FreeFile(readState->tableFile);
@@ -1080,33 +1094,6 @@ DeserializeBlockData(StripeBuffers *stripeBuffers, uint64 blockIndex,
 		}
 	}
 }
-
-
-/* Returns the size of the given file handle. */
-static int64
-FileSize(FILE *file)
-{
-	int64 fileSize = 0;
-	int fseekResult = 0;
-
-	errno = 0;
-	fseekResult = fseeko(file, 0, SEEK_END);
-	if (fseekResult != 0)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not seek in file: %m")));
-	}
-
-	fileSize = ftello(file);
-	if (fileSize == -1)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not get position in file: %m")));
-	}
-
-	return fileSize;
-}
-
 
 /* Reads the given segment from the given file. */
 static StringInfo

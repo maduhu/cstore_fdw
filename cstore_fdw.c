@@ -48,6 +48,7 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
+#include <rados/librados.h>
 
 /* local functions forward declarations */
 static void CStoreProcessUtility(Node *parseTree, const char *queryString,
@@ -159,6 +160,37 @@ cstore_ddl_event_end_trigger(PG_FUNCTION_ARGS)
 {
 	EventTriggerData *triggerData = NULL;
 	Node *parseTree = NULL;
+	rados_t *rados;
+	rados_ioctx_t *ioctx;
+	int ret;
+
+	rados = palloc0(sizeof(*rados));
+	ret = rados_create(rados, NULL);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not create rados cluster object: ret=%d", ret)));
+	}
+
+	/* FIXME: how should this stuff be configured? */
+	ret = rados_conf_read_file(*rados, "/home/nwatkins/projects/ceph/src/ceph.conf");
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not read ceph conf file: ret=%d", ret)));
+	}
+
+	ret = rados_connect(*rados);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("xcould not connect to ceph: ret=%d", ret)));
+	}
+
+	ioctx = palloc0(sizeof(*ioctx));
+	ret = rados_ioctx_create(*rados, "rbd", ioctx);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not open ceph pool: %s ret=%d",
+				"rbd", ret)));
+	}
 
 	/* error if event trigger manager did not call this function */
 	if (!CALLED_AS_EVENT_TRIGGER(fcinfo))
@@ -197,16 +229,19 @@ cstore_ddl_event_end_trigger(PG_FUNCTION_ARGS)
 			 * Initialize state to write to the cstore file. This creates an
 			 * empty data file and a valid footer file for the table.
 			 */
-			writeState = CStoreBeginWrite(cstoreFdwOptions->filename,
+			writeState = CStoreBeginWrite(cstoreFdwOptions->filename, ioctx,
 										  cstoreFdwOptions->compressionType,
 										  cstoreFdwOptions->stripeRowCount,
 										  cstoreFdwOptions->blockRowCount,
 										  tupleDescriptor);
-			CStoreEndWrite(writeState);
+			CStoreEndWrite(ioctx, writeState);
 
 			heap_close(relation, ExclusiveLock);
 		}
 	}
+
+	rados_ioctx_destroy(*ioctx);
+	rados_shutdown(*rados);
 
 	PG_RETURN_NULL();
 }
@@ -384,6 +419,9 @@ CopyIntoCStoreTable(const CopyStmt *copyStatement, const char *queryString)
 	TableWriteState *writeState = NULL;
 	CStoreFdwOptions *cstoreFdwOptions = NULL;
 	MemoryContext tupleContext = NULL;
+	rados_t *rados;
+	rados_ioctx_t *ioctx;
+	int ret;
 
 	List *columnNameList = copyStatement->attlist;
 	if (columnNameList != NULL)
@@ -413,6 +451,41 @@ CopyIntoCStoreTable(const CopyStmt *copyStatement, const char *queryString)
 	cstoreFdwOptions = CStoreGetOptions(relationId);
 
 	/*
+	 * Open up a connection to rados. As we discover more about how
+	 * cstore_fdw is using storage we'll pull more and more out into a set
+	 * of requirements that we want to support in a relational data
+	 * service.
+	 */
+	rados = palloc0(sizeof(*rados));
+	ret = rados_create(rados, NULL);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not create rados cluster object: ret=%d", ret)));
+	}
+
+	/* FIXME: how should this stuff be configured? */
+	ret = rados_conf_read_file(*rados, "/home/nwatkins/projects/ceph/src/ceph.conf");
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not read ceph conf file: ret=%d", ret)));
+	}
+
+	ret = rados_connect(*rados);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("xcould not connect to ceph: ret=%d", ret)));
+	}
+
+	ioctx = palloc0(sizeof(*ioctx));
+	ret = rados_ioctx_create(*rados, "rbd", ioctx);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not open ceph pool: %s ret=%d",
+				"rbd", ret)));
+	}
+
+
+	/*
 	 * We create a new memory context called tuple context, and read and write
 	 * each row's values within this memory context. After each read and write,
 	 * we reset the memory context. That way, we immediately release memory
@@ -431,7 +504,7 @@ CopyIntoCStoreTable(const CopyStmt *copyStatement, const char *queryString)
 							  copyStatement->options);
 
 	/* init state to write to the cstore file */
-	writeState = CStoreBeginWrite(cstoreFdwOptions->filename,
+	writeState = CStoreBeginWrite(cstoreFdwOptions->filename, ioctx,
 								  cstoreFdwOptions->compressionType,
 								  cstoreFdwOptions->stripeRowCount,
 								  cstoreFdwOptions->blockRowCount,
@@ -456,8 +529,11 @@ CopyIntoCStoreTable(const CopyStmt *copyStatement, const char *queryString)
 
 	/* end read/write sessions and close the relation */
 	EndCopyFrom(copyState);
-	CStoreEndWrite(writeState);
+	CStoreEndWrite(ioctx, writeState);
 	heap_close(relation, ExclusiveLock);
+
+	rados_ioctx_destroy(*ioctx);
+	rados_shutdown(*rados);
 
 	return processedRowCount;
 }
@@ -1360,6 +1436,9 @@ CStoreBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	ForeignScan *foreignScan = NULL;
 	List *foreignPrivateList = NIL;
 	List *whereClauseList = NIL;
+	rados_t *rados;
+	rados_ioctx_t *ioctx;
+	int ret;
 
 	/* if Explain with no Analyze, do nothing */
 	if (executorFlags & EXEC_FLAG_EXPLAIN_ONLY)
@@ -1370,12 +1449,46 @@ CStoreBeginForeignScan(ForeignScanState *scanState, int executorFlags)
 	foreignTableId = RelationGetRelid(scanState->ss.ss_currentRelation);
 	cstoreFdwOptions = CStoreGetOptions(foreignTableId);
 
+	/*
+	 * Open up a connection to rados. As we discover more about how
+	 * cstore_fdw is using storage we'll pull more and more out into a set
+	 * of requirements that we want to support in a relational data
+	 * service.
+	 */
+	rados = palloc0(sizeof(*rados));
+	ret = rados_create(rados, NULL);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not create rados cluster object: ret=%d", ret)));
+	}
+
+	/* FIXME: how should this stuff be configured? */
+	ret = rados_conf_read_file(*rados, "/home/nwatkins/projects/ceph/src/ceph.conf");
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not read ceph conf file: ret=%d", ret)));
+	}
+
+	ret = rados_connect(*rados);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("xcould not connect to ceph: ret=%d", ret)));
+	}
+
+	ioctx = palloc0(sizeof(*ioctx));
+	ret = rados_ioctx_create(*rados, "rbd", ioctx);
+	if (ret) {
+		ereport(ERROR, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+			errmsg("could not open ceph pool: %s ret=%d",
+				"rbd", ret)));
+	}
+
 	foreignScan = (ForeignScan *) scanState->ss.ps.plan;
 	foreignPrivateList = (List *) foreignScan->fdw_private;
 	whereClauseList = foreignScan->scan.plan.qual;
 
 	columnList = (List *) linitial(foreignPrivateList);
-	readState = CStoreBeginRead(cstoreFdwOptions->filename, tupleDescriptor,
+	readState = CStoreBeginRead(cstoreFdwOptions->filename, rados, ioctx, tupleDescriptor,
 								columnList, whereClauseList);
 
 	scanState->fdw_state = (void *) readState;
@@ -1707,7 +1820,7 @@ CStoreBeginForeignModify(ModifyTableState *modifyTableState,
 	cstoreFdwOptions = CStoreGetOptions(foreignTableOid);
 	tupleDescriptor = RelationGetDescr(relationInfo->ri_RelationDesc);
 
-	writeState = CStoreBeginWrite(cstoreFdwOptions->filename,
+	writeState = CStoreBeginWrite(cstoreFdwOptions->filename, NULL,
 								  cstoreFdwOptions->compressionType,
 								  cstoreFdwOptions->stripeRowCount,
 								  cstoreFdwOptions->blockRowCount,
@@ -1756,7 +1869,7 @@ CStoreEndForeignModify(EState *executorState, ResultRelInfo *relationInfo)
 	{
 		Relation relation = writeState->relation;
 
-		CStoreEndWrite(writeState);
+		CStoreEndWrite(NULL, writeState);
 		heap_close(relation, ExclusiveLock);
 	}
 }

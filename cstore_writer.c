@@ -30,8 +30,9 @@
 #include "utils/pg_lzcompress.h"
 #include "utils/rel.h"
 
+#include <rados/librados.h>
 
-static void CStoreWriteFooter(StringInfo footerFileName, TableFooter *tableFooter);
+static void CStoreWriteFooter(rados_ioctx_t *ioctx, StringInfo footerFileName, TableFooter *tableFooter);
 static StripeBuffers * CreateEmptyStripeBuffers(uint32 stripeMaxRowCount,
 												uint32 blockRowCount,
 												uint32 columnCount);
@@ -60,6 +61,19 @@ static void WriteToFile(FILE *file, void *data, uint32 dataLength);
 static void SyncAndCloseFile(FILE *file);
 static StringInfo CopyStringInfo(StringInfo sourceString);
 
+static void
+WriteToObject(rados_ioctx_t *ioctx, const char *oid, void *data, uint32 dataLength, uint64 offset)
+{
+	int ret;
+
+	if (dataLength == 0)
+		return;
+
+	ret = rados_write(*ioctx, oid, data, dataLength, offset);
+	if (ret) {
+		ereport(ERROR, (errmsg("failed to write object: ret=%d", ret)));
+	}
+}
 
 /*
  * CStoreBeginWrite initializes a cstore data load operation and returns a table
@@ -69,7 +83,7 @@ static StringInfo CopyStringInfo(StringInfo sourceString);
  * will be added.
  */
 TableWriteState *
-CStoreBeginWrite(const char *filename, CompressionType compressionType,
+CStoreBeginWrite(const char *filename, rados_ioctx_t *ioctx, CompressionType compressionType,
 				 uint64 stripeMaxRowCount, uint32 blockRowCount,
 				 TupleDesc tupleDescriptor)
 {
@@ -82,17 +96,27 @@ CStoreBeginWrite(const char *filename, CompressionType compressionType,
 	uint64 currentFileOffset = 0;
 	uint32 columnCount = 0;
 	uint32 columnIndex = 0;
-	struct stat statBuffer;
-	int statResult = 0;
 	bool *columnMaskArray = NULL;
 	ColumnBlockData **blockData = NULL;
+	int ret;
 
 	tableFooterFilename = makeStringInfo();
 	appendStringInfo(tableFooterFilename, "%s%s", filename, CSTORE_FOOTER_FILE_SUFFIX);
 
-	statResult = stat(tableFooterFilename->data, &statBuffer);
-	if (statResult < 0)
-	{
+	Assert(ioctx != NULL);
+
+	/*
+	 * The table footer contains some state, and also acts as a marker for
+	 * the existence of the table. If the footer doesn't exist, we create
+	 * / overwrite a file for the table, and allocate an empty footer
+	 * structure. Otherwise, we open the table for reading and fill in the
+	 * footer info from the file.
+	 *
+	 * The footer is written after updates.
+	 */
+	ret = rados_stat(*ioctx, tableFooterFilename->data, NULL, NULL);
+	if (ret) {
+		// fixme: remove when pure rados
 		tableFile = AllocateFile(filename, "w");
 		if (tableFile == NULL)
 		{
@@ -104,9 +128,9 @@ CStoreBeginWrite(const char *filename, CompressionType compressionType,
 		tableFooter = palloc0(sizeof(TableFooter));
 		tableFooter->blockRowCount = blockRowCount;
 		tableFooter->stripeMetadataList = NIL;
-	}
-	else
-	{
+	} else {
+
+		// fixme: remove when pure rados
 		tableFile = AllocateFile(filename, "r+");
 		if (tableFile == NULL)
 		{
@@ -115,7 +139,7 @@ CStoreBeginWrite(const char *filename, CompressionType compressionType,
 								   filename)));
 		}
 
-		tableFooter = CStoreReadFooter(tableFooterFilename);
+		tableFooter = CStoreReadFooter(ioctx, tableFooterFilename);
 	}
 
 	/*
@@ -310,11 +334,9 @@ CStoreWriteRow(TableWriteState *writeState, Datum *columnValues, bool *columnNul
  * file to the original footer file.
  */
 void
-CStoreEndWrite(TableWriteState *writeState)
+CStoreEndWrite(rados_ioctx_t *ioctx, TableWriteState *writeState)
 {
 	StringInfo tableFooterFilename = NULL;
-	StringInfo tempTableFooterFileName = NULL;
-	int renameResult = 0;
 	int columnCount = writeState->tupleDescriptor->natts;
 	StripeBuffers *stripeBuffers = writeState->stripeBuffers;
 
@@ -332,23 +354,13 @@ CStoreEndWrite(TableWriteState *writeState)
 	SyncAndCloseFile(writeState->tableFile);
 
 	tableFooterFilename = writeState->tableFooterFilename;
-	tempTableFooterFileName = makeStringInfo();
-	appendStringInfo(tempTableFooterFileName, "%s%s", tableFooterFilename->data,
-					 CSTORE_TEMP_FILE_SUFFIX);
-
-	CStoreWriteFooter(tempTableFooterFileName, writeState->tableFooter);
-
-	renameResult = rename(tempTableFooterFileName->data, tableFooterFilename->data);
-	if (renameResult != 0)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not rename file \"%s\" to \"%s\": %m",
-							   tempTableFooterFileName->data,
-							   tableFooterFilename->data)));
-	}
-
-	pfree(tempTableFooterFileName->data);
-	pfree(tempTableFooterFileName);
+	/*
+	 * In the file system version the footer is written to a temporary
+	 * file and then atomically renamed. We'd like to be able to at least
+	 * have the same guarantees that the atomic rename trick provides for
+	 * the file system version.
+	 */
+	CStoreWriteFooter(ioctx, tableFooterFilename, writeState->tableFooter);
 
 	MemoryContextDelete(writeState->stripeWriteContext);
 	list_free_deep(writeState->tableFooter->stripeMetadataList);
@@ -368,35 +380,36 @@ CStoreEndWrite(TableWriteState *writeState)
  * the last byte of the file. Last, the function syncs and closes the footer file.
  */
 static void
-CStoreWriteFooter(StringInfo tableFooterFilename, TableFooter *tableFooter)
+CStoreWriteFooter(rados_ioctx_t *ioctx, StringInfo tableFooterFilename, TableFooter *tableFooter)
 {
-	FILE *tableFooterFile = NULL;
 	StringInfo tableFooterBuffer = NULL;
 	StringInfo postscriptBuffer = NULL;
 	uint8 postscriptSize = 0;
+	uint64 offset = 0;
+	int ret;
 
-	tableFooterFile = AllocateFile(tableFooterFilename->data, PG_BINARY_W);
-	if (tableFooterFile == NULL)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not open file \"%s\" for writing: %m",
-							   tableFooterFilename->data)));
+	ret = rados_trunc(*ioctx, tableFooterFilename->data, 0);
+	if (ret) {
+		ereport(ERROR, (errmsg("failed to truncate footer: ret=%d", ret)));
 	}
 
 	/* write the footer */
 	tableFooterBuffer = SerializeTableFooter(tableFooter);
-	WriteToFile(tableFooterFile, tableFooterBuffer->data, tableFooterBuffer->len);
+	WriteToObject(ioctx, tableFooterFilename->data,
+		tableFooterBuffer->data, tableFooterBuffer->len, offset);
+	offset += tableFooterBuffer->len;
 
 	/* write the postscript */
 	postscriptBuffer = SerializePostScript(tableFooterBuffer->len);
-	WriteToFile(tableFooterFile, postscriptBuffer->data, postscriptBuffer->len);
+	WriteToObject(ioctx, tableFooterFilename->data,
+		postscriptBuffer->data, postscriptBuffer->len, offset);
+	offset += postscriptBuffer->len;
 
 	/* write the 1-byte postscript size */
 	Assert(postscriptBuffer->len < CSTORE_POSTSCRIPT_SIZE_MAX);
 	postscriptSize = postscriptBuffer->len;
-	WriteToFile(tableFooterFile, &postscriptSize, CSTORE_POSTSCRIPT_SIZE_LENGTH);
-
-	SyncAndCloseFile(tableFooterFile);
+	WriteToObject(ioctx, tableFooterFilename->data,
+		&postscriptSize, CSTORE_POSTSCRIPT_SIZE_LENGTH, offset);
 
 	pfree(tableFooterBuffer->data);
 	pfree(tableFooterBuffer);

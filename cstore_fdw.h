@@ -21,6 +21,7 @@
 #include "lib/stringinfo.h"
 #include "utils/rel.h"
 
+#include <rados/librados.h>
 
 /* Defines for valid option names */
 #define OPTION_NAME_FILENAME "filename"
@@ -263,6 +264,9 @@ typedef struct TableReadState
 	ColumnBlockData **blockDataArray;
 	int32 deserializedBlockIndex;
 
+  rados_t *rados;
+  rados_ioctx_t *ioctx;
+
 } TableReadState;
 
 
@@ -310,18 +314,19 @@ extern Datum cstore_fdw_validator(PG_FUNCTION_ARGS);
 
 /* Function declarations for writing to a cstore file */
 extern TableWriteState * CStoreBeginWrite(const char *filename,
+										  rados_ioctx_t *ioctx,
 										  CompressionType compressionType,
 										  uint64 stripeMaxRowCount,
 										  uint32 blockRowCount,
 										  TupleDesc tupleDescriptor);
 extern void CStoreWriteRow(TableWriteState *state, Datum *columnValues,
 						   bool *columnNulls);
-extern void CStoreEndWrite(TableWriteState * state);
+extern void CStoreEndWrite(rados_ioctx_t *ioctx, TableWriteState * state);
 
 /* Function declarations for reading from a cstore file */
-extern TableReadState * CStoreBeginRead(const char *filename, TupleDesc tupleDescriptor,
+extern TableReadState * CStoreBeginRead(const char *filename, rados_t *rados, rados_ioctx_t *ioctx, TupleDesc tupleDescriptor,
 										List *projectedColumnList, List *qualConditions);
-extern TableFooter * CStoreReadFooter(StringInfo tableFooterFilename);
+extern TableFooter * CStoreReadFooter(rados_ioctx_t *ioctx, StringInfo tableFooterFilename);
 extern bool CStoreReadFinished(TableReadState *state);
 extern bool CStoreReadNextRow(TableReadState *state, Datum *columnValues,
 							  bool *columnNulls);
