@@ -1,0 +1,26 @@
+# Footer
+
+The footer contains the following metadata:
+
+1. List of stripe metadata
+2. Block row count
+
+The stripe metadata contains the position and size of all the stripes in the
+file. This means that the footer acts a lot like a block list in a file
+system.
+
+# Connection pooling
+
+* Check with mysql_fdw for an example
+
+# Examining the schema of a table
+
+tupleDescriptor = RelationGetDescr(relation);
+columnCount = tupleDescriptor->natts;
+columnValues = palloc0(columnCount * sizeof(Datum));
+columnNulls = palloc0(columnCount * sizeof(bool));
+
+# Optimizer/Planner
+
+* Caching / no-caching assumption
+* Bubble up cache positions of data

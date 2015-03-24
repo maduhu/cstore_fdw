@@ -5,10 +5,10 @@
 
 MODULE_big = cstore_fdw
 
-PG_CPPFLAGS = --std=c99
-SHLIB_LINK = -lprotobuf-c -lrados
+PG_CPPFLAGS = --std=c99 -I/home/nwatkins/projects/install/include
+SHLIB_LINK = -lprotobuf-c -lrados -L/home/nwatkins/projects/install/lib
 OBJS = cstore.pb-c.o cstore_fdw.o cstore_writer.o cstore_reader.o \
-       cstore_metadata_serialization.o
+       cstore_metadata_serialization.o connection.o
 
 EXTENSION = cstore_fdw
 DATA = cstore_fdw--1.2.sql cstore_fdw--1.1--1.2.sql cstore_fdw--1.0--1.1.sql
@@ -38,7 +38,7 @@ ifndef MAJORVERSION
     MAJORVERSION := $(basename $(VERSION))
 endif
 
-ifeq (,$(findstring $(MAJORVERSION), 9.3 9.4))
+ifeq (,$(findstring $(MAJORVERSION), 9.3 9.4 9.5))
     $(error PostgreSQL 9.3 or 9.4 is required to compile this extension)
 endif
 
